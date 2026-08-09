@@ -18,6 +18,7 @@ from givenergy_modbus.model.battery import BatteryRegisterGetter
 from givenergy_modbus.model.components import (
     Battery,
     InverterHolding,
+    bank_components,
     components_for,
     modelled_fields,
     restrict_to_banks,
@@ -80,15 +81,15 @@ async def test_two_batteries_are_two_units_on_one_connection(connection):
     assert second.soc is not None
 
 
-async def test_an_absent_bank_aborts_the_whole_update(connection):
-    """A refused block throws away everything already read — the sharp edge here.
+async def test_a_component_spanning_banks_fails_as_a_whole(connection):
+    """One plan fails as a whole, so a component must not span banks it may lose.
 
     An inverter component declares every bank any GivEnergy inverter might
     serve, because ``register_ranges`` is a class attribute. A Gen-1 hybrid
-    answers three of them and refuses the rest, and one refusal fails the
-    update: the fields that *did* come back are discarded with it. Absent banks
-    are routine on this hardware — which is why the client's own poll reports
-    ``RefreshPartiallySucceeded`` and keeps the partial data.
+    answers three and refuses the rest, and the single plan those fields share
+    fails on the first refusal — taking the banks that did answer with it. That
+    is the read being all-or-nothing, which is the right default; the fix is to
+    stop asking for a device's banks in one read.
     """
     inverter = InverterHolding(connection.for_unit(INVERTER))
 
@@ -97,6 +98,40 @@ async def test_an_absent_bank_aborts_the_whole_update(connection):
 
     assert raised.value.block is not None  # which block was refused
     assert inverter.serial_number is None  # HR(0-59) was read, then dropped
+
+
+async def test_per_bank_components_isolate_a_refused_bank(connection):
+    """Modelling per bank matches the device's own success/failure granularity.
+
+    A GivEnergy device serves a page whole or refuses it whole, so one component
+    per bank means a refusal fails only its own component and every served bank
+    still decodes. It costs nothing: the banks are disjoint pages, so the eleven
+    reads here are exactly what a single pooled plan would have issued.
+    """
+    unit = connection.for_unit(INVERTER)
+    reads: list[tuple[int, int]] = []
+    connection.add_frame_listener(
+        lambda pdu: (
+            reads.append((pdu.base_register, pdu.register_count)) if isinstance(pdu, ReadRegistersResponse) else None
+        )
+    )
+
+    served, refused = {}, {}
+    for (space, bank), component in bank_components("inverter", unit).items():
+        if space != "holding":
+            continue
+        try:
+            await component.async_update()
+            served[bank] = component
+        except ModbusExceptionError:
+            refused[bank] = component
+
+    assert sorted(served) == HYBRID_HOLDING_BANKS
+    assert refused, "the hybrid should have refused the banks it does not serve"
+    # Every bank was still asked for exactly once — isolation costs no extra traffic.
+    assert len(reads) == len(served) + len(refused)
+    assert served[(0, 59)].serial_number  # survived a sibling bank's refusal
+    assert served[(60, 119)].battery_charge_limit is not None
 
 
 async def test_narrowing_to_the_detected_banks_makes_the_read_work(connection):

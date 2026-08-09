@@ -2,7 +2,7 @@
 
 A survey of ~65 real-world Modbus libraries classified this one **BLOCKED**: a custom "Transparent" framer with an embedded device serial and its own CRC, a mandatory dongle heartbeat, a transmit throttle, FC06-only writes, and last-good data served on a rejected read. The survey's answer to that class of library was that `modbus-connection`'s pure Protocol layer — `ModbusConnection` and the `ModbusUnit` Protocol, neither of which imports a backend — *is* the extension seam, and that such a library needs no library work at all.
 
-This migration tests that claim. The verdict up front: **the transport seam holds completely, and the model framework holds for 1253 of 1260 register definitions.** Nothing in `modbus-connection` had to change. Three things had to be reached around, and a handful of gaps cost real code — all detailed below.
+This migration tests that claim. The verdict up front: **the transport seam holds completely, and the model framework holds for 1253 of 1260 register definitions.** Nothing in `modbus-connection` had to change, and nothing needed to. Four things had to be reached around — all of them things the shipped backends reach around too — and one genuine gap cost ugly code. Details below.
 
 Where this landed:
 
@@ -11,7 +11,7 @@ Where this landed:
 | `givenergy_modbus/connection.py` | 890 lines — the transport as a `ModbusConnection` backend |
 | `givenergy_modbus/model/components.py` | 506 lines — every device family as a `Component` |
 | `givenergy_modbus/client/client.py` | −471 / +183 lines: the socket, the pump tasks and the retry loop moved out |
-| tests | 1764 passing, including the model layer driven end to end over real framing |
+| tests | 1765 passing, including the model layer driven end to end over real framing |
 
 ---
 
@@ -56,7 +56,7 @@ FC16 does not exist on this hardware. Every write is a single-register FC06 — 
 
 ### Which registers exist depends on the device, and you have to find out
 
-There is no discovery function code. `detect()` probes candidate device addresses and banks, and infers topology from what answers and what stays silent — an all-zero response means "missing", an error response means "this bank isn't served here", silence means "nothing at this address". An AC-coupled inverter answers `HR(300-359)` and a hybrid times out on it; extended charge slots exist above a firmware threshold on some models only. **The readable address map is a runtime discovery, not a static fact** — which turns out to be the single biggest friction point with the model framework.
+There is no discovery function code. `detect()` probes candidate device addresses and banks, and infers topology from what answers and what stays silent — an all-zero response means "missing", an error response means "this bank isn't served here", silence means "nothing at this address". An AC-coupled inverter answers `HR(300-359)` and a hybrid times out on it; extended charge slots exist above a firmware threshold on some models only. **The readable address map is a runtime discovery, not a static fact**, which is what shapes how the device has to be modelled: per bank, since a bank is what the device serves or refuses as a unit.
 
 ---
 
@@ -70,9 +70,9 @@ Short list, and none of it is fatal. Nothing was monkeypatched, nothing was vend
 
 ### Reached around — four things
 
-**`self._client`, read and written directly.** The base class treats `_client` as "the connected backend client", and `connected` is `_client is not None`. When the transport tells us the link died — reader EOF, a stalled drain, a socket error — a backend has to make `connected` go false and let the next request start a fresh connect flight. There is no hook for that. So `_note_lost()` sets `self._client = None` itself, and `_live_session()` clears it again if a session died inside the connect flight.
+**`self._client` and `self._lost_callbacks.fire()`.** The base class treats `_client` as "the connected backend client", and `connected` is `_client is not None`. When the link dies — reader EOF, a stalled drain, a socket error — a backend has to make `connected` go false, fire the subscribers, and let the next request start a fresh connect flight. `on_connection_lost()` is public for *subscribing*, and there is no protected helper for *reporting*, so `_note_lost()` does it by hand.
 
-**`self._lost_callbacks.fire()`.** Same cause. `on_connection_lost()` is public for *subscribing*; there is no protected way for a backend to say the link went away.
+This turns out to be the established pattern rather than a hole: tmodbus's `_on_connection_lost` and pymodbus's `_on_trace_connect` end with the same two lines against the same two privates. Ours is a third copy of it. See (a) below.
 
 **`self._pacer`.** The inherited `Pacer` is protected, which is fine for the connection itself — the producer wraps each wire write in `async with self._pacer.paced(unit_id)`. But `set_message_spacing` lives on the *unit*, and a unit handle is not a subclass of the connection, so `GivEnergyUnit` calls a `set_unit_spacing()` method added to the connection purely to bridge that gap.
 
@@ -94,28 +94,32 @@ No fork, no vendored copy, no patched planner, no reimplemented `Component`. The
 
 ## 3. What could modbus-connection do better?
 
-Ordered by how much each one cost.
+Ordered by how much each one cost. (a) and (b) are corrections: my first pass overstated both, and checking them against the shipped backends and against a measurement deflated them.
 
-### a. A backend has no way to say "the link died" — **the biggest gap**
+### a. Reporting connection loss is copy-pasted into every backend
 
-Every custom transport that owns its own socket needs this, and every one will write the same three lines against private attributes:
+Both shipped backends end their loss hook with the same lines against base-class privates — tmodbus's `_on_connection_lost`, pymodbus's `_on_trace_connect`:
 
 ```python
 self._client = None
 self._lost_callbacks.fire()
 ```
 
-**Fix:** a protected `_connection_lost(exc)` on `ModbusConnection` that clears the client, fires the callbacks, and is a no-op during a deliberate `close()`/`disconnect()`. Two of those three behaviours we had to reimplement anyway (the third — not firing during a deliberate teardown — we got wrong first and fixed after a test hung). Give it a documented contract and every backend gets it right.
+So the mechanism isn't missing; it's just not shared, and ours is a third copy. That's a DRY nit, not a capability gap.
 
-While you're there: a lost session's transport is never closed. `close()` works off `_client`, which is exactly what the loss cleared, so the socket leaks and the peer keeps its handler alive. We found this because a test hung in `Server.wait_closed()`. Whatever ships as `_connection_lost` should close the client it drops.
+**Fix:** a protected `_connection_lost()` on `ModbusConnection` doing exactly what all three do today. Small win, but it would also pin down the contract: both backends guard with `if self._closed or self._client is None`, relying on `close()`/`disconnect()` unpublishing the client first, so a hook that finds no published client knows it is watching our own teardown. That's a neater invariant than the "am I closing?" flag we invented, and it's currently only discoverable by reading two backends.
 
-### b. Partial reads are all-or-nothing — **the biggest gap in the model layer**
+One thing genuinely differs for a self-detecting backend: tmodbus and pymodbus are *told* by their transport, so the socket is already gone by the time the hook runs. We detect EOF ourselves with the writer still open, so we have to close it — a shared helper should not assume the transport is already down.
 
-`ReadPlan.execute` re-raises a refused block, and everything already read in that pass is discarded. On this hardware that is not an edge case: absent banks are *routine* — an inverter model that doesn't serve `HR(300-359)`, a three-phase bank on a single-phase unit, a battery slot with nothing in it. `tests/test_components_end_to_end.py::test_an_absent_bank_aborts_the_whole_update` pins the behaviour: the inverter's identity bank is read successfully and then thrown away because a later bank was refused.
+### b. A component must not span banks it might lose — but that's the device's fault
 
-This is finding **C** from the original review, marked "Not planned". Having now hit it with real hardware traces, it is the difference between the model layer being usable for a GivEnergy poll and not. The library already tolerates *per-field* failures; the gap is per-*block*.
+`ReadPlan.execute` re-raises a refused block and discards the pass. My first framing of this as the biggest model-layer gap was wrong: it's the correct all-or-nothing default, and modelling per *bank* rather than per *device family* fits GivEnergy exactly, because a bank is precisely what this hardware succeeds or fails at — it serves a page whole or refuses it whole.
 
-**Fix:** let a refused block set its fields to `None` and continue, and report what failed. Something like `async_update(partial=True)` returning the refused `ReadBlock`s, or an `on_block_error` callback. Raising by default is a reasonable choice; raising with *no option* is not.
+`bank_components()` does that, and `tests/.../test_per_bank_components_isolate_a_refused_bank` measures the cost: eleven components, **eleven reads** — byte-for-byte what a single pooled plan would have issued, because the banks are disjoint pages that could never have been merged. The three served banks decode; the eight refused ones fail alone. The only real constraint is that you must poll them individually: putting them back in a `ComponentGroup` pools them into one plan, and one plan fails as a whole.
+
+So: not a bug, and the workaround is free. What remains is a documentation gap — nothing says "size a component to your device's failure granularity, and don't group components that can fail independently". That is a non-obvious modelling rule, and the natural instinct (one component per device) is the wrong one for any device with capability-gated banks.
+
+**Fix:** document the rule. If anything more, an opt-in `async_update(partial=True)` that sets a refused block's fields to `None` and reports the failed `ReadBlock`s would let a device be modelled per family *and* tolerate absent banks — but it is a convenience, not a necessity.
 
 ### c. `register_ranges` says what's readable, not where a block may start
 
@@ -190,4 +194,4 @@ Worth saying plainly, because it is most of the story:
 
 **With one caveat the survey didn't name:** the seam is sufficient for *request/response*, and GivEnergy dongles also volunteer frames. The heartbeat has to be answered, LAN-config broadcasts arrive unbidden, and a shared dongle delivers another consumer's register responses — all carrying data as current as our own. The Protocol has no room for any of it, so `GivEnergyConnection` grew `add_frame_listener()`. That is not a defect in the Protocol — it should stay request/response — but it does mean "implement `ModbusUnit` and you're done" is only true for devices that speak when spoken to. A backend for a chatty device will always need a second, native surface, and the docs should say so.
 
-**The model framework is a different answer: mostly yes, with (b) and (c) as the real blockers.** 1253 of 1260 fields translate, and the planned reads match the library's own request pattern exactly — but a component that can't tolerate a refused block can't poll a device whose banks depend on its model, and one that can't be told to read whole pages will ask a page-oriented device for the wrong base. Both are small, well-defined changes.
+**The model framework: also yes, with one blocker and one modelling rule.** 1253 of 1260 fields translate, and the planned reads match the library's own request pattern exactly. The blocker is (c) — a component that can't be told to read whole pages will ask a page-oriented device for the wrong base, and the placeholder-field workaround is ugly. The rule is (b): size a component to the device's failure granularity and poll independently-failing components separately. Nothing forced a library change there either; it just isn't written down anywhere, and the obvious modelling is the wrong one.

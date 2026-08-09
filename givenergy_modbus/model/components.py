@@ -461,6 +461,38 @@ def components_for(family: str, unit: Any) -> tuple[list[Component], ComponentGr
     return components, ComponentGroup(unit, components)
 
 
+def bank_components(family: str, unit: Any) -> dict[tuple[RegisterSpace, Range], Component]:
+    """Build one component per readable bank, keyed by the space and bank it reads.
+
+    The key carries the space because holding and input are separate address
+    spaces: an inverter has a bank at ``HR(0-59)`` *and* one at ``IR(0-59)``.
+
+    A bank is the unit a GivEnergy device succeeds or fails at: it serves a page
+    whole or refuses it whole, and which pages it serves depends on the model
+    and firmware. A component that spans several banks therefore inherits their
+    combined failure — one refusal fails the whole read, and the banks that did
+    answer are discarded with it.
+
+    Modelling per bank matches the device's own granularity, so a refused page
+    fails only its own component. It costs nothing in traffic: the banks are
+    disjoint pages, so a pooled plan could never have merged them into fewer
+    reads anyway. Poll the components individually — putting them in a
+    :class:`ComponentGroup` would pool them back into a single plan, and a
+    single plan fails as a whole.
+
+    Use this when the served banks are unknown; use :func:`components_for` plus
+    :func:`restrict_to_banks` once ``detect()`` has established them.
+    """
+    components: dict[tuple[RegisterSpace, Range], Component] = {}
+    for klass in SPLIT_FAMILIES.get(family) or (INPUT_ONLY_FAMILIES[family],):
+        for bank in klass.register_ranges or ():
+            component = klass(unit)
+            restrict_to_banks(component, [bank])
+            if modelled_fields(component):
+                components[(klass.register_space, bank)] = component
+    return components
+
+
 def restrict_to_banks(component: Component, banks: Iterable[Range]) -> None:
     """Narrow ``component`` to the fields inside ``banks``, and reshape its plan.
 
@@ -499,6 +531,7 @@ __all__ = [
     "Meter",
     "ThreePhaseInverterHolding",
     "ThreePhaseInverterInput",
+    "bank_components",
     "component_class",
     "components_for",
     "modelled_fields",

@@ -9,6 +9,28 @@ requests, which you send via `one_shot_command` or `execute`.
 > change (`detect()` + `load_config()`/`refresh()` replacing `refresh_plant`) and the
 > attribute renames.
 
+### Connections
+
+The library's transport is a [modbus-connection](https://home-assistant-libs.github.io/modbus-connection/)
+backend: `GivEnergyConnection` implements that library's `ModbusConnection`, and `connection.for_unit(device_address)`
+hands back a `ModbusUnit` for any device on the plant. `Client.for_host(...)` builds and owns a connection for you,
+which is what you want when the client is the only consumer.
+
+The link is established on demand, so `connect()` is optional — call it to fail fast at startup instead of on the
+first read. A `Client` is also an async context manager.
+
+When something else already holds a connection to the same dongle, share it rather than opening a second socket:
+
+```python
+from givenergy_modbus.client.client import Client
+from givenergy_modbus.connection import GivEnergyConnection, GivEnergyParams
+
+connection = GivEnergyConnection(GivEnergyParams(host="192.168.99.99"))
+client = Client(connection)
+...
+await connection.close()   # the owner closes it; client.close() only releases this consumer
+```
+
 ## Basic example
 
 ```python
@@ -19,8 +41,7 @@ from givenergy_modbus.model import TimeSlot
 from givenergy_modbus.model.inverter import Model
 
 async def main():
-    client = Client(host="192.168.99.99", port=8899)
-    await client.connect()
+    client = Client.for_host(host="192.168.99.99", port=8899)
 
     # Detect the topology once, then read the config banks (needed for slot_map).
     # load_config()/refresh() raise RefreshPartiallySucceeded / RefreshFailed on
@@ -74,8 +95,7 @@ distinguish can catch that.
 from givenergy_modbus.exceptions import RefreshFailed, RefreshPartiallySucceeded
 
 async def main():
-    client = Client(host="192.168.99.99", port=8899)
-    await client.connect()
+    client = Client.for_host(host="192.168.99.99", port=8899)
     await client.detect()
 
     while True:
@@ -412,7 +432,7 @@ with open("capture.txt", "w") as f:
         ts = datetime.now(UTC).isoformat(timespec="microseconds")
         f.write(f"{ts} {direction} {frame.hex()}\n")
         f.flush()
-    async with Client("inverter.local", 8899) as client:
+    async with Client.for_host("inverter.local", 8899) as client:
         await client.detect()
 
         async def poll():

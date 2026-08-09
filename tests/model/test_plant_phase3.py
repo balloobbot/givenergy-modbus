@@ -4,7 +4,7 @@ Covers:
 - Plant.serial_index — new additive property
 - Plant.add_direct_source() — inject direct-inverter caches for reconciliation
 - Plant.inverters reconciliation — EMS + direct source merged by serial
-- Client(host, plant=existing_plant) — shared-plant constructor kwarg
+- Client.for_host(host, plant=existing_plant) — shared-plant constructor kwarg
 """
 
 from givenergy_modbus.model.devices import Inverter
@@ -183,17 +183,17 @@ def test_plant_inverters_skips_direct_cache_with_no_serial():
 
 
 def test_client_accepts_existing_plant():
-    """Client(host, plant=p) uses the supplied plant rather than creating a new one."""
+    """Client.for_host(host, plant=p) uses the supplied plant rather than creating a new one."""
     from givenergy_modbus.client.client import Client
 
     shared = Plant()
-    client = Client("10.0.0.1", 8899, plant=shared)
+    client = Client.for_host("10.0.0.1", 8899, plant=shared)
     assert client.plant is shared
 
 
 def test_client_creates_fresh_plant_when_none_supplied():
-    """Regression: Client() with no plant arg still creates its own Plant."""
+    """Regression: Client.for_host() with no plant arg still creates its own Plant."""
     from givenergy_modbus.client.client import Client
 
-    client = Client("10.0.0.1", 8899)
+    client = Client.for_host("10.0.0.1", 8899)
     assert isinstance(client.plant, Plant)

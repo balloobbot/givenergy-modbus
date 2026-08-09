@@ -1,6 +1,7 @@
 """Tests for Client.detect() and PlantCapabilities."""
 
 from datetime import UTC, datetime
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -11,10 +12,11 @@ from givenergy_modbus.model.inverter import Model
 from givenergy_modbus.model.plant import PlantCapabilities
 from givenergy_modbus.model.register import HR, IR
 from givenergy_modbus.pdu import ReadInputRegistersResponse
+from tests.transport import prime_session
 
 
 def _make_client() -> Client:
-    client = Client("localhost", 8899)
+    client = Client.for_host("localhost", 8899)
     return client
 
 
@@ -1137,7 +1139,7 @@ async def test_detect_ems_tolerates_rollup_read_timeout(caplog):
                 caps = await client.detect()
 
     assert caps.is_ems is True  # detection still succeeded despite the rollup timing out
-    assert any("EMS rollup read at IR(2040,55) timed out" in rec.message for rec in caplog.records), (
+    assert any("EMS rollup read at IR(2040,55) went unanswered" in rec.message for rec in caplog.records), (
         f"expected timeout warning; got {[r.message for r in caplog.records]}"
     )
 
@@ -1514,21 +1516,13 @@ async def test_detect_primary_battery_survives_cold_start_hold():
 # ---------------------------------------------------------------------------
 
 
-def _prime_live_connection(client: Client) -> MagicMock:
-    """Put the client in a post-connect() state so the real close() can run.
+def _prime_live_connection(client: Client) -> Any:
+    """Put the client's connection in a post-connect state over mock streams.
 
-    Mirrors the mock-socket setup in tests/client/test_client.py — a MagicMock
-    writer whose wait_closed is awaitable, a reader, both background tasks, and
-    connected=True. Returns the writer for teardown assertions.
+    Returns the mock writer, so a test can assert the teardown actually closed
+    the socket rather than only flipping a flag.
     """
-    writer = MagicMock()
-    writer.wait_closed = AsyncMock()
-    client.writer = writer
-    client.reader = MagicMock()
-    client.network_producer_task = MagicMock()
-    client.network_consumer_task = MagicMock()
-    client.connected = True
-    return writer
+    return prime_session(client.connection).writer
 
 
 @pytest.mark.asyncio
@@ -1801,7 +1795,7 @@ async def test_probe_alive_true_when_fresh_hr0_commits_leaves_socket_open():
     leaving the socket up for refresh()).
     """
     client = _make_client()
-    client.connected = True
+    _prime_live_connection(client)
 
     async def _ok_commits(request, *, timeout, retries):
         _stamp_hr0(client, datetime.now(UTC))  # fresh read survives the commit guards
@@ -1824,7 +1818,7 @@ async def test_probe_alive_false_on_stale_hr0_when_fresh_read_does_not_commit():
     deriving it from 'did this probe re-stamp the block' correctly returns False + closes.
     """
     client = _make_client()
-    client.connected = True
+    _prime_live_connection(client)
     _prime_cache(client, 0x11, {HR(0): 0x2001})  # stale-but-good HR(0) from a prior connection
     _stamp_hr0(client, datetime(2020, 1, 1, tzinfo=UTC))  # its ingestion time, before this probe
 
@@ -1847,26 +1841,26 @@ async def test_probe_alive_false_on_timeout_closes_socket_no_raise():
     tick — no reprobe-same-socket branch.
     """
     client = _make_client()
-    client.connected = True
+    _prime_live_connection(client)
 
     async def _timeout(request, *, timeout, retries):
         raise TimeoutError
 
-    close_calls = []
-    orig_close = client.close
+    teardowns = []
+    orig_disconnect = client.connection.disconnect
 
-    async def _spy_close():
-        close_calls.append(True)
-        await orig_close()
+    async def _spy_disconnect():
+        teardowns.append(True)
+        await orig_disconnect()
 
     with (
         patch.object(client, "send_request_and_await_response", side_effect=_timeout),
-        patch.object(client, "close", side_effect=_spy_close),
+        patch.object(client.connection, "disconnect", side_effect=_spy_disconnect),
     ):
         alive = await client.probe_alive(timeout=0.1, retries=0)
 
     assert alive is False  # returned, not raised
-    assert close_calls  # teardown happened
+    assert teardowns  # the link was dropped, not merely flagged
     assert client.connected is False
 
 
@@ -1878,7 +1872,7 @@ async def test_probe_alive_false_when_answered_but_nothing_commits_closes():
     and close — the coordinator keeps probing rather than detecting off a corrupt identity.
     """
     client = _make_client()
-    client.connected = True
+    _prime_live_connection(client)
 
     async def _ok_no_commit(request, *, timeout, retries):
         return MagicMock()  # "responded" but nothing stamps the HR(0,60) block
@@ -1897,7 +1891,7 @@ async def test_probe_alive_reads_hr0_at_0x11_with_given_retries():
     The same proven read detect uses, so retries=0 fails fast on a hung dongle.
     """
     client = _make_client()
-    client.connected = True
+    _prime_live_connection(client)
     _prime_cache(client, 0x11, {HR(0): 0x2001})
     seen = {}
 

@@ -10,7 +10,7 @@ from givenergy_modbus.model.plant import PlantCapabilities
 
 
 def _client_with_caps(model: Model, **kwargs) -> Client:
-    client = Client("localhost", 8899)
+    client = Client.for_host("localhost", 8899)
     client.plant.capabilities = PlantCapabilities(device_type=model, **kwargs)
     return client
 
@@ -268,7 +268,7 @@ async def test_refresh_without_caps_raises_plant_not_detected():
     """
     from givenergy_modbus.exceptions import PlantNotDetected
 
-    client = Client("localhost", 8899)
+    client = Client.for_host("localhost", 8899)
     with patch.object(client, "_execute_reads", new_callable=AsyncMock) as mock_exec:
         with pytest.raises(PlantNotDetected, match="detect()"):
             await client.refresh()
@@ -279,7 +279,7 @@ async def test_load_config_without_caps_raises_plant_not_detected():
     """load_config() likewise refuses without capabilities (#105)."""
     from givenergy_modbus.exceptions import PlantNotDetected
 
-    client = Client("localhost", 8899)
+    client = Client.for_host("localhost", 8899)
     with patch.object(client, "_execute_reads", new_callable=AsyncMock) as mock_exec:
         with pytest.raises(PlantNotDetected, match="detect()"):
             await client.load_config()
@@ -491,7 +491,7 @@ async def test_probe_passes_zero_retry_delay():
     Detect() does many speculative absent-device probes and most are expected to fail;
     a non-zero retry_delay there would add seconds to discovery for no diagnostic value.
     """
-    client = Client("localhost", 8899)
+    client = Client.for_host("localhost", 8899)
     with patch.object(client, "send_request_and_await_response", new_callable=AsyncMock) as mock_send:
         from givenergy_modbus.pdu import ReadInputRegistersRequest
 

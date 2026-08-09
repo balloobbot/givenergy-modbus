@@ -56,7 +56,7 @@ def _is_ir0(request: object, inverter: int) -> bool:
 
 
 async def soak(args: argparse.Namespace) -> None:
-    client = Client(args.host, args.port)
+    client = Client.for_host(args.host, args.port)
     await client.connect()
     _logger.info("connected to %s:%d — detecting…", args.host, args.port)
     caps = await client.detect(timeout=args.timeout, retries=1)

@@ -49,7 +49,7 @@ async def read_bank(client: Client, addr: int, base: int) -> int:
 
 
 async def main(host: str) -> None:
-    client = Client(host, 8899)
+    client = Client.for_host(host, 8899)
     await client.connect()
     try:
         print(f"probing {host}:8899 — {ATTEMPTS} attempts per bank, 3s timeout + 1 retry each\n")

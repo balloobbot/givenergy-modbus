@@ -2,11 +2,11 @@
 
 import asyncio
 import logging
-from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from givenergy_modbus.client.client import Client, FrameRedactor
+from tests.transport import connection_with_pumps, stop_pumps
 
 # ---------------------------------------------------------------------------
 # FrameRedactor — frame-aware redaction
@@ -335,31 +335,22 @@ async def test_capture_frames_tees_rx_to_sink_redacted():
     """The RX capture path redacts a valid frame's serial before passing to the sink."""
     from givenergy_modbus.pdu import ClientIncomingMessage
 
-    client = Client(host="foo", port=4321)
-    # Wire up a mock reader that yields one frame then EOF
+    client = Client.for_host(host="foo", port=4321)
     frame = _make_holding_response("CE2231G454")
-
-    reader = MagicMock()
-    reader.at_eof.side_effect = [False, True]
-    reader.read = AsyncMock(side_effect=[frame, b""])
-    client.reader = reader
-    client.framer = MagicMock()
-    client.framer.decode = MagicMock(return_value=_aiter([]))
+    session = connection_with_pumps(client.connection)
 
     captured: list[tuple[str, bytes]] = []
     capture = asyncio.create_task(client.capture_frames(lambda d, f: captured.append((d, f)), duration=0.05))
     await asyncio.sleep(0)
 
-    consumer = asyncio.create_task(client._task_network_consumer())
+    # Feed the frame in as though the dongle had sent it, so the connection's
+    # real consumer task drives the capture tap.
+    session.reader.feed_data(frame)
     try:
         await asyncio.sleep(0.1)
         await capture
     finally:
-        consumer.cancel()
-        try:
-            await consumer
-        except asyncio.CancelledError:
-            pass
+        await stop_pumps(session)
 
     rx_frames = [f for d, f in captured if d == "rx"]
     if rx_frames:
@@ -372,7 +363,7 @@ async def test_capture_frames_tees_rx_to_sink_redacted():
 
 async def test_capture_frames_refuses_concurrent_capture():
     """A second capture started while one is in flight raises immediately."""
-    client = Client(host="foo", port=4321)
+    client = Client.for_host(host="foo", port=4321)
     client._capture_sink = lambda _d, _f: None
     with pytest.raises(RuntimeError, match="already running"):
         await client.capture_frames(lambda _d, _f: None, duration=0.01)
@@ -380,7 +371,7 @@ async def test_capture_frames_refuses_concurrent_capture():
 
 async def test_capture_frames_releases_sink_on_cancellation():
     """If the capture task is cancelled mid-sleep, the sink slot is freed."""
-    client = Client(host="foo", port=4321)
+    client = Client.for_host(host="foo", port=4321)
     capture = asyncio.create_task(client.capture_frames(lambda _d, _f: None, duration=10.0))
     await asyncio.sleep(0)
     assert client._capture_sink is not None
@@ -394,7 +385,7 @@ async def test_capture_frames_releases_sink_on_cancellation():
 
 def test_emit_to_sink_swallows_sink_exceptions(caplog):
     """A sink callback that raises must not propagate out of the network tasks."""
-    client = Client(host="foo", port=4321)
+    client = Client.for_host(host="foo", port=4321)
 
     def boom(_direction, _data):
         raise RuntimeError("sink blew up")
@@ -407,7 +398,7 @@ def test_emit_to_sink_swallows_sink_exceptions(caplog):
 
 def test_emit_to_sink_noops_without_sink_or_data():
     """No active sink, or empty data, is a silent no-op."""
-    client = Client(host="foo", port=4321)
+    client = Client.for_host(host="foo", port=4321)
     calls = []
     client._emit_to_sink("rx", b"data")
     client._capture_sink = lambda d, f: calls.append((d, f))
@@ -461,7 +452,7 @@ def test_frame_redactor_recovers_from_oversized_length_field():
 
 async def test_capture_frames_resets_state_on_completion():
     """capture_frames installs the sink/redactors for its duration and tears them all down."""
-    client = Client(host="foo", port=4321)
+    client = Client.for_host(host="foo", port=4321)
     captured: list[tuple[str, bytes]] = []
 
     # duration=0 returns from the internal sleep immediately, then runs the finally block.
@@ -475,7 +466,7 @@ async def test_capture_frames_resets_state_on_completion():
 
 async def test_capture_frames_flushes_held_tail_on_close(monkeypatch):
     """On close, each direction's redactor tail is flushed to the sink so trailing bytes aren't lost."""
-    client = Client(host="foo", port=4321)
+    client = Client.for_host(host="foo", port=4321)
     emitted: list[tuple[str, bytes]] = []
     monkeypatch.setattr(client, "_emit_to_sink", lambda direction, data: emitted.append((direction, data)))
 

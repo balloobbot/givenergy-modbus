@@ -48,7 +48,7 @@ OFFLINE_BATTERY = 0x34
 
 
 def _client_with_caps(model: Model, **kwargs) -> Client:
-    client = Client("localhost", 8899)
+    client = Client.for_host("localhost", 8899)
     client.plant.capabilities = PlantCapabilities(device_type=model, **kwargs)
     return client
 
@@ -238,7 +238,7 @@ async def test_refresh_plant_warns_on_ignored_max_batteries():
 
 async def test_watch_plant_deprecated():
     """watch_plant() warns on entry (before doing any work)."""
-    client = Client("localhost", 8899)
+    client = Client.for_host("localhost", 8899)
     with patch.object(client, "connect", new_callable=AsyncMock, side_effect=RuntimeError("stop")):
         with pytest.warns(DeprecationWarning), pytest.raises(RuntimeError):
             await client.watch_plant()

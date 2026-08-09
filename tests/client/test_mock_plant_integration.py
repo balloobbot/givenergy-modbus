@@ -33,7 +33,7 @@ _CAPTURES = Path(__file__).parents[1] / "fixtures" / "captures"
 
 async def _connected_client(mock: MockPlant) -> tuple[Client, str, int]:
     host, port = await mock.start("127.0.0.1", 0)
-    client = Client(host, port, tx_message_wait=0, tx_jitter=0)
+    client = Client.for_host(host, port, tx_message_wait=0, tx_jitter=0)
     await client.connect()
     return client, host, port
 

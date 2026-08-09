@@ -68,7 +68,7 @@ async def probe_at(client: Client, device_address: int, original: int) -> bool:
 
 
 async def main(host: str) -> None:
-    client = Client(host, 8899)
+    client = Client.for_host(host, 8899)
     await client.connect()
     try:
         caps = await client.detect()

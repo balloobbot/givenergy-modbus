@@ -1,19 +1,18 @@
 import asyncio
 import logging
-import random
 import re
-import socket
 import warnings
-from asyncio import Future, Queue, StreamReader, StreamWriter, Task
+from asyncio import Future
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
-from typing import Literal
+from datetime import datetime
 
+from modbus_connection import ModbusExceptionError
+
+from givenergy_modbus.connection import Direction, GivEnergyConnection, GivEnergyParams
 from givenergy_modbus.exceptions import (
     CommunicationError,
     ConnectionLost,
-    ExceptionBase,
     InvalidPduState,
     PlantNotDetected,
     PlantTopologyMismatch,
@@ -21,7 +20,6 @@ from givenergy_modbus.exceptions import (
     RefreshFailed,
     RefreshPartiallySucceeded,
 )
-from givenergy_modbus.framer import ClientFramer, Framer
 from givenergy_modbus.model import manifest
 from givenergy_modbus.model.ems import EmsRegisterGetter
 from givenergy_modbus.model.inverter import Model, resolve_model
@@ -40,13 +38,12 @@ from givenergy_modbus.model.plant import (
 from givenergy_modbus.model.register import HR, IR
 from givenergy_modbus.model.register_cache import RegisterCache
 from givenergy_modbus.pdu import (
-    HeartbeatRequest,
     ReadHoldingRegistersRequest,
     ReadInputRegistersRequest,
     TransparentRequest,
     TransparentResponse,
-    WriteHoldingRegisterResponse,
 )
+from givenergy_modbus.pdu.base import BasePDU
 from givenergy_modbus.pdu.write_registers import INSTALLER_WRITE_REGISTERS, WriteHoldingRegisterRequest
 
 _logger = logging.getLogger(__name__)
@@ -56,7 +53,12 @@ _logger = logging.getLogger(__name__)
 # (``CE0000G000``). Used to sanity-check serial strings decoded out of the EMS rollup.
 _GE_SERIAL_STR_PATTERN = re.compile(r"^[A-Z]{2}\d{4}[A-Z]\d{3}$")
 
-Direction = Literal["rx", "tx"]
+# A read the device did not serve: it either stayed silent (``TimeoutError``) or refused
+# outright with an error response (``ModbusExceptionError``). Detection treats both as
+# "nothing here" — only the transport cares which, and it already distinguishes them.
+# ``ConnectionLost`` is a ``TimeoutError``, so handlers that must not swallow a dead link
+# still catch it first.
+DEVICE_DID_NOT_ANSWER = (TimeoutError, ModbusExceptionError)
 
 
 # Serial-register groups (which register addresses carry serial values) come from the
@@ -377,11 +379,24 @@ def _refresh_ranges(
 
 
 class Client:
-    """Asynchronous client for talking to a GivEnergy inverter over Modbus TCP.
+    """Asynchronous client for talking to a GivEnergy plant over Modbus TCP.
 
-    Holds a long-lived connection drained by a single producer/consumer task pair.
-    All public methods are coroutines and assume they're awaited from the same
-    asyncio event loop.
+    The client is a *consumer* of a :class:`~givenergy_modbus.connection.GivEnergyConnection`,
+    not the owner of a socket. That split is ``modbus-connection``'s model: one
+    physical link addresses many units, and sharing a single internally-serialised
+    connection between consumers beats each opening its own competing socket to a
+    dongle that is already the bottleneck. Build the connection once and hand it
+    to whoever needs it::
+
+        connection = GivEnergyConnection(GivEnergyParams(host="192.168.1.50"))
+        client = Client(connection)
+
+    :meth:`for_host` is the shorthand for the single-consumer case; the client it
+    returns owns its connection and closes it on :meth:`close`.
+
+    The link is established on demand — the first request connects — so
+    :meth:`connect` is only needed to establish it eagerly. All public methods
+    are coroutines and assume they're awaited from the same asyncio event loop.
 
     Concurrency contract
     --------------------
@@ -396,13 +411,14 @@ class Client:
       (``one_shot_command``) may run concurrently. Their request/response pairs
       occupy disjoint shape-hash spaces, so they never collide in the in-flight
       tracking dict.
-    - ``tx_queue`` is a FIFO drained by a single producer task with rate limiting
-      between frames; bytes from one frame never interleave with another. A queued
-      frame whose response future is already done (i.e. resolved by a late arrival
-      from a previous attempt) is skipped at dequeue time rather than written to
-      the wire, so retry storms don't duplicate work the inverter has already done.
-    - Incoming frames are reassembled and dispatched serially by the consumer
-      task, so register-cache mutations are applied one PDU at a time.
+    - The connection's transmit queue is a FIFO drained by a single producer task
+      with rate limiting between frames; bytes from one frame never interleave
+      with another. A queued frame whose response future is already done (i.e.
+      resolved by a late arrival from a previous attempt) is skipped at dequeue
+      time rather than written to the wire, so retry storms don't duplicate work
+      the inverter has already done.
+    - Incoming frames are reassembled and dispatched serially by the connection's
+      consumer task, so register-cache mutations are applied one PDU at a time.
 
     **Must be serialised**
 
@@ -419,63 +435,41 @@ class Client:
       overlap. Writes don't need the same lock — they're free to land between
       polls.
     - Connection loss is surfaced three ways: ``self.connected`` flips to
-      ``False``, the noticing task logs a WARNING, and every in-flight or
+      ``False``, the connection logs a WARNING, and every in-flight or
       subsequently attempted request raises ``ConnectionLost`` (a
-      ``CommunicationError`` that is also a ``TimeoutError``, so legacy
-      ``except TimeoutError`` handling keeps working — catch ``ConnectionLost``
-      first to distinguish reconnect-me from a genuine stall). ``connect()`` is
-      idempotent and tears down the previous connection on its own, so it can
-      be called directly as a reconnect primitive.
+      ``CommunicationError`` that is also a ``ModbusConnectionError`` and a
+      ``TimeoutError``, so legacy ``except TimeoutError`` handling keeps working
+      — catch ``ConnectionLost`` first to distinguish reconnect-me from a genuine
+      stall). Recovery needs no explicit step: the next request reconnects.
+      ``connection.disconnect()`` forces a fresh link for a peer that holds the
+      socket open but stops answering.
     """
 
-    framer: Framer
-    expected_responses: dict[int, Future[TransparentResponse]] = {}
     plant: Plant
-    # refresh_count: int = 0
-    # debug_frames: Dict[str, Queue]
-    connected = False
-    _shutting_down = False
+    connection: GivEnergyConnection
+
     _capture_sink: Callable[[Direction, bytes], None] | None = None
     # Per-direction stream redactors for an active capture — carry a small tail
     # across socket-read chunks so a serial split across a boundary is still
     # redacted (#117). Created in capture_frames(), None when no capture runs.
     _capture_redactor_rx: "FrameRedactor | None" = None
     _capture_redactor_tx: "FrameRedactor | None" = None
-    reader: StreamReader
-    writer: StreamWriter
-    network_consumer_task: Task | None
-    network_producer_task: Task | None
-
-    # (raw_frame, frame_sent_future, response_future). frame_sent_future is signalled by
-    # the producer once the frame has been written; response_future, when present, is
-    # consulted before writing so a frame whose response already arrived (e.g. as a late
-    # arrival to a previous attempt) is skipped rather than duplicated on the wire.
-    tx_queue: Queue[tuple[bytes, Future | None, Future | None]]
 
     def __init__(
         self,
-        host: str,
-        port: int,
-        connect_timeout: float = 2.0,
-        tx_message_wait: float = 0.25,
-        tx_jitter: float = 0.1,
+        connection: GivEnergyConnection,
+        *,
         plant: Plant | None = None,
         splice_heal_seconds: float | None = None,
         splice_reject_heal_seconds: float | None = None,
     ) -> None:
-        self.host = host
-        self.port = port
-        self.connect_timeout = connect_timeout
-        # Minimum gap between consecutive frames hitting the wire. Empirically
-        # load-bearing across hardware generations — see issue #71 for context.
-        self.tx_message_wait = tx_message_wait
-        # Upper bound on the additive random jitter applied on top of
-        # tx_message_wait. Disperses concurrent bursts (polling ticks, retry
-        # storms) so they don't clump at fixed 250 ms boundaries. Asymmetric
-        # by design — preserves the historic tx_message_wait floor and only
-        # ever lengthens the gap; set to 0 to disable.
-        self.tx_jitter = tx_jitter
-        self.framer = ClientFramer()
+        """Drive the plant reachable over ``connection``.
+
+        The connection is not owned: :meth:`close` leaves it open for its other
+        consumers. Use :meth:`for_host` when this client is the only consumer.
+        """
+        self.connection = connection
+        self._owns_connection = False
         # ``plant`` is for single-owner pre-built plants only (e.g. restoring a
         # persisted PlantCapabilities). Do NOT share one Plant across two active
         # Clients: both call plant.update() into the same register_caches, and
@@ -500,136 +494,104 @@ class Client:
         # Applied only when explicitly given, so an injected plant's own value isn't clobbered.
         if splice_reject_heal_seconds is not None:
             self.plant.splice_reject_heal_seconds = splice_reject_heal_seconds
-        self.tx_queue = Queue(maxsize=20)
-        self.expected_responses = {}
-        self._shutting_down = False
-        self._connection_lost = False
-        # Reader-EOF reconnect-churn coalescing state (#355-style, see _note_eof_drop). Persists
-        # across reconnects — a marginal dongle drops repeatedly, so the burst must be tracked on
-        # the long-lived Client, not per-connection.
-        self._eof_drop_count = 0
-        self._eof_last_warn_at: datetime | None = None
-        self._eof_last_drop_at: datetime | None = None
-        self.network_producer_task: Task | None = None
-        self.network_consumer_task: Task | None = None
-        # self.debug_frames = {
-        #     'all': Queue(maxsize=1000),
-        #     'error': Queue(maxsize=1000),
-        # }
+        # Every decoded frame the connection sees is ingested, not only the answers
+        # to this client's own requests. A GivEnergy dongle volunteers register
+        # responses (its heartbeat traffic, and — when another consumer shares the
+        # link — that consumer's replies), and those carry data that is just as
+        # current as our own. The request/response Protocol has no room for them,
+        # so the connection hands them out here.
+        self._unsubscribe_frames = connection.add_frame_listener(self._ingest_frame)
+
+    @classmethod
+    def for_host(
+        cls,
+        host: str,
+        port: int = 8899,
+        *,
+        connect_timeout: float = 2.0,
+        tx_message_wait: float = 0.25,
+        tx_jitter: float = 0.1,
+        plant: Plant | None = None,
+        splice_heal_seconds: float | None = None,
+        splice_reject_heal_seconds: float | None = None,
+    ) -> "Client":
+        """Build a client that owns a fresh connection to ``host``.
+
+        The shorthand for the single-consumer case. ``tx_message_wait`` is the
+        minimum gap between consecutive frames on the wire, empirically
+        load-bearing across hardware generations (#71); ``tx_jitter`` bounds the
+        additive random jitter on top of it, which disperses coordinated bursts
+        so they don't clump at fixed 250 ms boundaries. The jitter is asymmetric
+        by design — it only ever lengthens the gap; set it to 0 to disable.
+        """
+        client = cls(
+            GivEnergyConnection(
+                GivEnergyParams(host=host, port=port),
+                timeout=connect_timeout,
+                message_spacing=tx_message_wait,
+                tx_jitter=tx_jitter,
+            ),
+            plant=plant,
+            splice_heal_seconds=splice_heal_seconds,
+            splice_reject_heal_seconds=splice_reject_heal_seconds,
+        )
+        client._owns_connection = True
+        return client
+
+    @property
+    def connected(self) -> bool:
+        """Whether the underlying link is up."""
+        return self.connection.connected
+
+    @property
+    def host(self) -> str:
+        """Host name or IP address of the dongle."""
+        return self.connection.host
+
+    @property
+    def port(self) -> int:
+        """TCP port of the dongle's Modbus server."""
+        return self.connection.port
+
+    def _ingest_frame(self, pdu: BasePDU) -> None:
+        """Commit a decoded register response to the plant's caches."""
+        if isinstance(pdu, TransparentResponse):
+            self.plant.update(pdu)
 
     async def connect(self) -> None:
-        """Connect to the remote host and start background tasks.
+        """Establish the link eagerly.
 
-        Idempotent: if the client is already connected, the existing connection
-        and background tasks are torn down before establishing a new one. This
-        makes ``connect()`` safe to use as a reconnect primitive without a
-        separate ``close()`` step, and guarantees the new background tasks see
-        ``_shutting_down`` as False even after a prior ``close()``.
+        Optional: the connection is established on demand by the first request.
+        Call this to fail fast at startup, or to pay the connect cost before a
+        latency-sensitive first poll. A no-op when already connected.
         """
-        # After an unexpected EOF the consumer sets ``connected = False`` and exits,
-        # but the reader/writer/producer-task can still be live — calling
-        # ``connect()`` again without a tear-down would leave the old producer task
-        # running against shared state alongside the new one. Treat any of those
-        # leftover resources as "needs cleanup", not just the ``connected`` flag.
-        if (
-            self.connected
-            or self.network_consumer_task is not None
-            or self.network_producer_task is not None
-            or getattr(self, "reader", None) is not None
-            or getattr(self, "writer", None) is not None
-        ):
-            await self.close()
-        self._shutting_down = False
-        self._connection_lost = False
-        try:
-            connection = asyncio.open_connection(host=self.host, port=self.port, flags=socket.TCP_NODELAY)
-            self.reader, self.writer = await asyncio.wait_for(connection, timeout=self.connect_timeout)
-        except OSError as e:
-            raise CommunicationError(f"Error connecting to {self.host}:{self.port}") from e
-        self.network_consumer_task = asyncio.create_task(self._task_network_consumer(), name="network_consumer")
-        self.network_producer_task = asyncio.create_task(self._task_network_producer(), name="network_producer")
-        # asyncio.create_task(self._task_dump_queues_to_files(), name='dump_queues_to_files'),
-        self.connected = True
-        _logger.info(f"Connection established to {self.host}:{self.port}")
+        await self.connection.connect()
 
-    async def close(self):
-        """Disconnect from the remote host and clean up tasks and queues."""
-        self.connected = False
-        self._shutting_down = True
-        if self.tx_queue:
-            while not self.tx_queue.empty():
-                _, frame_sent, _ = self.tx_queue.get_nowait()
-                if frame_sent:
-                    frame_sent.cancel()
-        if self.network_producer_task:
-            self.network_producer_task.cancel()
-        if hasattr(self, "writer") and self.writer:
-            self.writer.close()
-            try:
-                await self.writer.wait_closed()
-            except ConnectionResetError:
-                pass
-            del self.writer
+    async def close(self) -> None:
+        """Release this client's hold on the connection.
 
-        if self.network_consumer_task:
-            self.network_consumer_task.cancel()
-        if hasattr(self, "reader") and self.reader:
-            self.reader.feed_eof()
-            self.reader.set_exception(RuntimeError("cancelling"))
-            del self.reader
-
-        self.expected_responses = {}
-        # self.debug_frames = {
-        #     'all': Queue(maxsize=1000),
-        #     'error': Queue(maxsize=1000),
-        # }
-
-    def _abort_connection(self, exc: ConnectionLost) -> None:
-        """Tear down shared state after an UNEXPECTED connection drop (#356).
-
-        Called by whichever network task notices death (reader EOF, writer
-        closing, stalled drain) — and by the send path's stuck-producer
-        safety net. Idempotent: the ``_connection_lost`` flag guards re-entry,
-        and every operation is a no-op the second time. Intentional shutdown
-        (``close()``) early-returns: the #50 quiet paths stay close()'s job.
-
-        Deliberately does NOT touch reader/writer/task attributes — connect()'s
-        leftover-check and close() own that cleanup (#274 atomicity).
+        A client built with :meth:`for_host` owns its connection and closes it.
+        A client handed a connection does not: other consumers may still be using
+        it, and closing a shared link out from under them is the failure mode the
+        shared-connection model exists to prevent. Close it yourself when done.
         """
-        if self._shutting_down or self._connection_lost:
-            return
-        self._connection_lost = True
-        self.connected = False
-        # Unblock in-flight senders awaiting a response.
-        aborted = 0
-        for fut in self.expected_responses.values():
-            if not fut.done():
-                fut.set_exception(exc)
-                aborted += 1
-        self.expected_responses = {}
-        # Unblock senders awaiting frame-sent for still-queued frames.
-        drained = 0
-        while not self.tx_queue.empty():
-            _, frame_sent, response_future = self.tx_queue.get_nowait()
-            for queued_fut in (frame_sent, response_future):
-                if queued_fut is not None and not queued_fut.done():
-                    queued_fut.set_exception(exc)
-            drained += 1
-        # Cancel the sibling task; the noticing task (if any) exits on its own.
-        current = asyncio.current_task()
-        for task in (self.network_consumer_task, self.network_producer_task):
-            if task is not None and task is not current and not task.done():
-                task.cancel()
-        _logger.debug(
-            "Connection teardown: aborted %d in-flight request(s), drained %d queued frame(s) (%s)",
-            aborted,
-            drained,
-            exc,
-        )
+        self._unsubscribe_frames()
+        if self._owns_connection:
+            await self.connection.close()
+
+    async def __aenter__(self) -> "Client":
+        """Enter a client context; the link is established on first use."""
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        """Release this client's hold on the connection (see :meth:`close`)."""
+        await self.close()
 
     async def _probe(self, request: TransparentRequest, timeout: float, retries: int) -> bool:
-        """Send a request; return True on success, False on TimeoutError.
+        """Send a request; return True if the device answered, False otherwise.
 
+        Both outcomes count as "absent": silence (a timeout) and an explicit
+        refusal (an error response, which surfaces as ``IllegalDataAddressError``).
         Uses ``retry_delay=0`` so absent-device probes don't pay the silent-
         window-survival cost — detect() does many of these and most are
         expected to fail.
@@ -639,7 +601,7 @@ class Client:
                 request, timeout=timeout, retries=retries, retry_delay=0, warn_timeout=False
             )
             return True
-        except TimeoutError:
+        except DEVICE_DID_NOT_ANSWER:
             return False
 
     async def _probe_ranges(
@@ -750,8 +712,8 @@ class Client:
                 timeout=timeout,
                 retries=retries,
             )
-        except TimeoutError:
-            _logger.warning("detect: EMS rollup read at IR(2040,55) timed out — skipping cross-check")
+        except DEVICE_DID_NOT_ANSWER:
+            _logger.warning("detect: EMS rollup read at IR(2040,55) went unanswered — skipping cross-check")
             return
         self._validate_ems_rollup()
 
@@ -857,13 +819,15 @@ class Client:
         except PlantTopologyMismatch:
             # Healthy connection — only the hint was wrong; capabilities already cleared.
             raise
-        except (TimeoutError, CommunicationError):
+        except (*DEVICE_DID_NOT_ANSWER, CommunicationError):
             # A connection-level failure leaves a half-open socket with capabilities
-            # unset. Tear down so connect()+detect() is atomic (#274). Guard close()
-            # so a teardown error (e.g. a flaky writer.wait_closed()) can't mask the
-            # original failure we're propagating.
+            # unset. Drop the link so connect()+detect() is atomic (#274). ``disconnect()``
+            # rather than ``close()``: the connection stays usable and reconnects on the
+            # next request — and it may be shared with other consumers, who have done
+            # nothing to deserve having it closed. Guarded so a teardown error (e.g. a
+            # flaky writer.wait_closed()) can't mask the original failure we're propagating.
             try:
-                await self.close()
+                await self.connection.disconnect()
             except Exception:
                 _logger.exception("detect: error during connection teardown after failure")
             raise
@@ -885,8 +849,8 @@ class Client:
         - **Alive** (HR(0) came back): the socket is left **open**, so the caller's follow-up
           ``detect`` reuses the same live connection.
         - **Not alive** (timeout / :class:`CommunicationError`, or a response that left no usable
-          HR(0)): the socket is **closed** (mirroring detect's #274 teardown), releasing it for the
-          dongle's quiet window so the coordinator uniformly reconnects next tick. Never raises.
+          HR(0)): the link is **dropped** (mirroring detect's #274 teardown), releasing the socket
+          for the dongle's quiet window; the next request re-establishes it. Never raises.
 
         Reuses the exact HR(0,60)@0x11 read :meth:`detect` uses (the read proven against real
         hardware). Reconnect cadence/backoff stays the caller's concern (#356): this owns only the
@@ -909,14 +873,14 @@ class Client:
             )
             stamped_after = self.plant.register_block_updated_at.get(block)
             alive = stamped_after is not None and stamped_after != stamped_before
-        except (TimeoutError, CommunicationError):
+        except (*DEVICE_DID_NOT_ANSWER, CommunicationError):
             alive = False
         if not alive:
             # Release the socket on any not-alive outcome, mirroring detect()'s teardown so a
-            # failed liveness check leaves no half-open connection. Guard close() so a teardown
+            # failed liveness check leaves no half-open connection. Guarded so a teardown
             # error can't turn a clean False into an exception.
             try:
-                await self.close()
+                await self.connection.disconnect()
             except Exception:
                 _logger.exception("probe_alive: error during connection teardown after failed liveness probe")
         return alive
@@ -966,7 +930,7 @@ class Client:
                     )
             except ConnectionLost:
                 raise  # a dead connection is not an absent battery (#356 dual-base ordering)
-            except TimeoutError:
+            except DEVICE_DID_NOT_ANSWER:
                 _logger.info("No LV battery answered at 0x32 — valid for gateways and battery-less plants (#358)")
                 self.plant.mark_absent(0x32, "IR", 60, 60)
                 self.plant.register_caches.pop(0x32, None)
@@ -1491,8 +1455,8 @@ class Client:
     def _emit_to_sink(self, direction: "Direction", data: bytes) -> None:
         """Hand redacted bytes to the active capture sink, swallowing sink errors.
 
-        The sink is a user-supplied callback. It runs inside the long-lived network
-        consumer/producer tasks (and the capture-close flush), so an exception it
+        The sink is a user-supplied callback. It runs inside the connection's
+        long-lived pump tasks (and the capture-close flush), so an exception it
         raises would otherwise crash that background task and break the client. A
         capture is a diagnostic tee, never load-bearing — log and carry on.
         """
@@ -1533,9 +1497,11 @@ class Client:
         self._capture_sink = sink
         self._capture_redactor_rx = FrameRedactor("rx")
         self._capture_redactor_tx = FrameRedactor("tx")
+        self.connection.set_byte_tap(self._redact_and_emit)
         try:
             await asyncio.sleep(duration)
         finally:
+            self.connection.set_byte_tap(None)
             # Flush each direction's held tail so the final bytes aren't lost.
             for direction, redactor in (("rx", self._capture_redactor_rx), ("tx", self._capture_redactor_tx)):
                 if redactor is not None:
@@ -1544,170 +1510,11 @@ class Client:
             self._capture_redactor_rx = None
             self._capture_redactor_tx = None
 
-    def _note_eof_drop(self, now: datetime) -> tuple[bool, int]:
-        """Coalesce a burst of reader-EOF reconnect churn; decide WARNING vs DEBUG (#355-style).
-
-        Returns ``(warn_now, count_since_last_warn)``. The first drop of a burst, and the first
-        drop past each ``_EOF_REWARN_SECONDS`` window within a *sustained* burst, warn and carry
-        the running tally of drops since the previous warning; drops in between return
-        ``(False, 0)`` for DEBUG.
-
-        A burst is a run of drops each within ``_EOF_REWARN_SECONDS`` of the previous one. When
-        the gap since the *last drop* exceeds the window the churn has clearly stopped, so the
-        burst is closed and the next drop starts fresh (count 1) rather than escalating with a
-        stale tally accumulated an hour ago — keeping the reported count honest (Codex note on
-        #401). A genuinely fresh problem is therefore never swallowed; only sustained churn is
-        throttled.
-        """
-        last_drop = self._eof_last_drop_at
-        if last_drop is not None and (now - last_drop).total_seconds() >= _EOF_REWARN_SECONDS:
-            # Preceding burst is over — reset so this drop is treated as a fresh onset.
-            self._eof_drop_count = 0
-            self._eof_last_warn_at = None
-        self._eof_last_drop_at = now
-        self._eof_drop_count += 1
-        last_warn = self._eof_last_warn_at
-        if last_warn is None or (now - last_warn).total_seconds() >= _EOF_REWARN_SECONDS:
-            count = self._eof_drop_count
-            self._eof_last_warn_at = now
-            self._eof_drop_count = 0
-            return True, count
-        return False, 0
-
-    async def _task_network_consumer(self):
-        """Task for orchestrating incoming data."""
-        while hasattr(self, "reader") and self.reader and not self.reader.at_eof():
-            frame = await self.reader.read(300)
-            if self._capture_sink is not None and frame and self._capture_redactor_rx is not None:
-                self._emit_to_sink("rx", self._capture_redactor_rx.feed(frame))
-            async for message in self.framer.decode(frame):
-                _logger.debug(f"Processing {message}")
-                if isinstance(message, ExceptionBase):
-                    _logger.warning(f"Expected response never arrived but resulted in exception: {message}")
-                    continue
-                if isinstance(message, HeartbeatRequest):
-                    _logger.debug("Responding to HeartbeatRequest")
-                    await self.tx_queue.put((message.expected_response().encode(), None, None))
-                    continue
-                if not isinstance(message, TransparentResponse):
-                    _logger.warning(f"Received unexpected message type for a client: {message}")
-                    continue
-                if isinstance(message, WriteHoldingRegisterResponse):
-                    if message.error:
-                        _logger.warning(f"{message}")
-                    else:
-                        _logger.info(f"{message}")
-
-                # Update the plant cache *before* resolving the awaiting future so
-                # the awaiter is guaranteed to see the updated cache regardless of
-                # asyncio scheduling order. Today this happens to work either way
-                # because nothing yields between set_result and plant.update, but
-                # that's fragile to future refactors — make it explicit.
-                self.plant.update(message)
-                # Don't resolve the future for a discarded CRC-failed frame — leave it
-                # pending so send_request_and_await_response's timeout/retry fires a fresh
-                # request rather than treating a corrupt frame as a successful read.
-                if getattr(message, "crc_failed", False) and not getattr(message, "lenient_crc_commit", False):
-                    continue
-                future = self.expected_responses.get(message.shape_hash(), None)
-                if future and not future.done():
-                    future.set_result(message)
-        if self._shutting_down:
-            _logger.debug("network_consumer exiting on intentional shutdown")
-        else:
-            self.connected = False
-            warn_now, count = self._note_eof_drop(datetime.now(UTC))
-            if warn_now and count > 1:
-                _logger.warning(
-                    "network_consumer: connection lost (reader at EOF) — %d drops since the previous "
-                    "warning, recovering transparently each time",
-                    count,
-                )
-            elif warn_now:
-                _logger.warning("network_consumer: connection lost (reader at EOF)")
-            else:
-                _logger.debug("network_consumer: connection lost (reader at EOF) — coalesced, recovering transparently")
-            self._abort_connection(ConnectionLost("reader at EOF — connection lost"))
-
-    async def _task_network_producer(self):
-        """Producer loop to transmit queued frames with an appropriate delay.
-
-        Frames whose response_future is already done (i.e. resolved by a late
-        arrival from a previous attempt that happened to arrive in the queueing
-        window) are skipped — there's no point writing a request whose answer
-        we already have. The frame_sent future is still signalled so the
-        caller-side awaiter unblocks normally.
-
-        Inter-frame sleep is ``tx_message_wait + uniform(0, tx_jitter)``. The
-        jitter is asymmetric — it never reduces the gap below ``tx_message_wait``
-        — so existing hardware-derived minimum spacing is preserved while
-        coordinated bursts (polling ticks, retry storms) disperse naturally.
-        """
-        while hasattr(self, "writer") and self.writer and not self.writer.is_closing():
-            message, frame_sent, response_future = await self.tx_queue.get()
-            if response_future is not None and response_future.done():
-                _logger.debug("Skipping wire send — response already resolved")
-                self.tx_queue.task_done()
-                if frame_sent and not frame_sent.done():
-                    frame_sent.set_result(True)
-                continue
-            try:
-                self.writer.write(message)
-                if self._capture_sink is not None and self._capture_redactor_tx is not None:
-                    self._emit_to_sink("tx", self._capture_redactor_tx.feed(message))
-                await asyncio.wait_for(self.writer.drain(), timeout=_DRAIN_TIMEOUT)
-            except TimeoutError:
-                _logger.warning(
-                    "network_producer: writer drain stalled >%.0fs — treating connection as lost",
-                    _DRAIN_TIMEOUT,
-                )
-                exc = ConnectionLost("writer drain stalled — connection lost")
-                # This frame is already dequeued, so the teardown's queue-drain
-                # can't reach it — fail its futures here.
-                for fut in (frame_sent, response_future):
-                    if fut is not None and not fut.done():
-                        fut.set_exception(exc)
-                self.tx_queue.task_done()
-                self._abort_connection(exc)
-                return
-            except OSError as e:
-                _logger.warning(
-                    "network_producer: socket error during write/drain (%s) — treating connection as lost", e
-                )
-                exc = ConnectionLost(f"socket error during write/drain — connection lost: {e}")
-                # This frame is already dequeued, so the teardown's queue-drain
-                # can't reach it — fail its futures here.
-                for fut in (frame_sent, response_future):
-                    if fut is not None and not fut.done():
-                        fut.set_exception(exc)
-                self.tx_queue.task_done()
-                self._abort_connection(exc)
-                return
-            self.tx_queue.task_done()
-            if frame_sent and not frame_sent.done():
-                frame_sent.set_result(True)
-            # B311: plain random is appropriate for non-cryptographic burst-dispersal jitter.
-            await asyncio.sleep(self.tx_message_wait + random.uniform(0, self.tx_jitter))  # nosec B311
-        if self._shutting_down:
-            _logger.debug("network_producer exiting on intentional shutdown")
-        else:
-            self.connected = False
-            _logger.warning("network_producer: connection lost (writer closing)")
-            self._abort_connection(ConnectionLost("writer closing — connection lost"))
-
-    # async def _task_dump_queues_to_files(self):
-    #     """Task to periodically dump debug message frames to disk for debugging."""
-    #     while True:
-    #         await asyncio.sleep(30)
-    #         if self.debug_frames:
-    #             os.makedirs('debug', exist_ok=True)
-    #             for name, queue in self.debug_frames.items():
-    #                 if not queue.empty():
-    #                     async with aiofiles.open(f'{os.path.join("debug", name)}_frames.txt', mode='a') as str_file:
-    #                         await str_file.write(f'# {arrow.utcnow().timestamp()}\n')
-    #                         while not queue.empty():
-    #                             item = await queue.get()
-    #                             await str_file.write(item.hex() + '\n')
+    def _redact_and_emit(self, direction: "Direction", data: bytes) -> None:
+        """Redact a chunk of raw wire bytes and hand the result to the sink."""
+        redactor = self._capture_redactor_rx if direction == "rx" else self._capture_redactor_tx
+        if redactor is not None:
+            self._emit_to_sink(direction, redactor.feed(data))
 
     def execute(
         self,
@@ -1726,7 +1533,7 @@ class Client:
             return_exceptions=return_exceptions,
         )
 
-    async def send_request_and_await_response(  # noqa: C901
+    async def send_request_and_await_response(
         self,
         request: TransparentRequest,
         timeout: float,
@@ -1736,6 +1543,10 @@ class Client:
     ) -> TransparentResponse:
         """Send a request to the remote, await and return the response.
 
+        A thin wrapper over the connection's raw-PDU surface that adds the one
+        thing the transport has no business knowing: which device's retry budget
+        a consumed retry belongs to.
+
         On timeout, ``retry_delay`` seconds pass before the next attempt is
         enqueued. The default of 0.5s was chosen to overcome the multi-second
         silent-window failure mode observed in the field — firing the retry
@@ -1744,110 +1555,11 @@ class Client:
         original "retry immediately" behaviour (e.g. fast probes, latency-
         sensitive interactive commands) should pass ``retry_delay=0``.
         """
-        if self._connection_lost:
-            raise ConnectionLost("connection lost — reconnect before sending")
-
-        # mark the expected response
-        expected_response = request.expected_response()
-        expected_shape_hash = expected_response.shape_hash()
-        existing_response_future = self.expected_responses.get(expected_shape_hash, None)
-        if existing_response_future and not existing_response_future.done():
-            _logger.debug(f"Cancelling existing in-flight request and replacing: {request}")
-            existing_response_future.cancel()
-
-        raw_frame = request.encode()
-
-        def _discard(fut: "Future[TransparentResponse]") -> None:
-            # Abandon a future and remove its registration — but only if it's still the one
-            # mapped under expected_shape_hash. A newer same-shaped caller may have replaced it
-            # (see existing_response_future above); evicting that newer mapping would leave the
-            # newer caller unable to receive its response.
-            fut.cancel()
-            if self.expected_responses.get(expected_shape_hash) is fut:
-                del self.expected_responses[expected_shape_hash]
-
-        tries = 0
-        while tries <= retries:
-            response_future: Future[TransparentResponse] = asyncio.get_running_loop().create_future()
-            self.expected_responses[expected_shape_hash] = response_future
-            frame_sent = asyncio.get_running_loop().create_future()
-            try:
-                await asyncio.wait_for(self.tx_queue.put((raw_frame, frame_sent, response_future)), timeout=5.0)
-            except TimeoutError as exc:
-                _discard(response_future)
-                raise TimeoutError("TX queue full — producer task has likely died") from exc
-            if self._connection_lost:
-                # Lost the race with _abort_connection's queue-drain: our frame was
-                # enqueued after the drain and will never be sent. _discard cancels the
-                # response future, so a post-reconnect producer skips the stale frame
-                # (the queue-front skip-if-resolved check).
-                _discard(response_future)
-                raise ConnectionLost("connection lost while enqueueing — reconnect before sending")
-            # Safety-net wait for the producer to actually send this frame. Worst case the
-            # frame sits behind a full queue, and the producer sleeps tx_message_wait + up to
-            # tx_jitter (plus a drain) between sends — so scale the bound by the full queue
-            # depth, not a flat constant. The old `qsize() + 1`, sampled *after* put() returned,
-            # could undershoot to ~1 s and fail a legitimately backlogged-but-healthy producer;
-            # a flat 5 s would do the same once the queue filled (20 × ~0.35 s ≈ 7 s). The 1.5×
-            # headroom covers per-frame drain and scheduling. Only fires if the producer is stuck.
-            frame_sent_timeout = max(
-                _FRAME_SENT_MIN_TIMEOUT,
-                self.tx_queue.maxsize * (self.tx_message_wait + self.tx_jitter) * 1.5,
-            )
-            try:
-                await asyncio.wait_for(frame_sent, timeout=frame_sent_timeout)
-            except ConnectionLost:
-                # Teardown failed this frame's future — propagate the typed signal.
-                _discard(response_future)
-                raise
-            except TimeoutError as exc:
-                # Drain is bounded (#356), so reaching this means the producer is
-                # wedged somewhere unknown — a genuine bug. Tear down so the
-                # system recovers, and keep the honest 'stuck' signal.
-                _discard(response_future)
-                self._abort_connection(ConnectionLost("producer stuck — tearing down"))
-                raise TimeoutError("Producer task is stuck — frame not sent") from exc
-            try:
-                await asyncio.wait_for(response_future, timeout=timeout)
-            except ConnectionLost:
-                raise  # a drop mid-await propagates immediately; never a retry
-            except TimeoutError:
-                tries += 1
-                _logger.debug(
-                    f"Timeout awaiting {expected_response} (future: {response_future}), "
-                    f"attempting retry {tries} of {retries}"
-                )
-                if tries <= retries:
-                    # Count the consumed retry (#284), but only where a response was genuinely
-                    # expected — absent-device detect probes pass warn_timeout=False and their
-                    # expected timeouts shouldn't pollute the per-device retry noise floor.
-                    if warn_timeout:
-                        self.plant.record_retry(request.device_address)
-                    if retry_delay > 0:
-                        # Discard the orphaned future so a late response from this attempt
-                        # doesn't accidentally resolve into the next attempt's future.
-                        response_future.cancel()
-                        await asyncio.sleep(retry_delay)
-                continue
-            response = response_future.result()
-            if tries > 0:
-                _logger.debug(f"Received {response} after {tries} tries")
-            if response.error:
-                _logger.error(f"Received error response, retrying: {response}")
-                tries += 1
-                # Unlike the timeout path above, no response_future.cancel() is needed here:
-                # the future is already resolved (we just called .result()), so cancel() would
-                # be a no-op, and the next attempt overwrites expected_responses[hash] anyway.
-                if tries <= retries:
-                    if warn_timeout:  # count the consumed retry (#284); skip absent-device probes
-                        self.plant.record_retry(request.device_address)
-                    if retry_delay > 0:
-                        await asyncio.sleep(retry_delay)
-                continue
-            return response
-
-        if warn_timeout:
-            _logger.warning(f"Timeout awaiting {expected_response} after {tries} tries at {timeout}s, giving up")
-        else:
-            _logger.debug(f"Timeout awaiting {expected_response} after {tries} tries at {timeout}s (probe miss)")
-        raise TimeoutError()
+        return await self.connection.execute(
+            request,
+            timeout=timeout,
+            retries=retries,
+            retry_delay=retry_delay,
+            warn_timeout=warn_timeout,
+            on_retry=lambda: self.plant.record_retry(request.device_address),
+        )

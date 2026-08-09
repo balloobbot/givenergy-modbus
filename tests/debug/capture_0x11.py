@@ -55,7 +55,7 @@ async def main(host: str, duration: float) -> None:
         ts = datetime.now(timezone.utc).isoformat()
         frames.append(f"{ts} {direction} {data.hex()}")
 
-    client = Client(host=host, port=8899)
+    client = Client.for_host(host=host, port=8899)
     await client.connect()
     try:
         print(f"starting {minutes}-minute capture to {outpath.name} ...")

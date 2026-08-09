@@ -128,7 +128,7 @@ reconciles EMS-rollup summaries with direct-source caches by serial number:
 matching serials yield `Inverter.merge()` (``data_source="merged"``); EMS-only
 slots stay blinded; orphan direct sources appear as ``data_source="direct"``
 entries. `Plant.serial_index` surfaces the reconciled view as
-`dict[str, Inverter]`. `Client(host, port, plant=p)` accepts an optional
+`dict[str, Inverter]`. `Client.for_host(host, port, plant=p)` accepts an optional
 pre-built plant for single-owner scenarios (e.g. restoring a persisted
 PlantCapabilities without re-running `detect()`). Do not share one `Plant`
 across two active `Client` instances — both call `plant.update()` into the same

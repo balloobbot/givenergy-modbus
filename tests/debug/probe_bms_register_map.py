@@ -336,7 +336,7 @@ async def main(
     client_log.propagate = False
     client_log.addHandler(logging.NullHandler())
 
-    client = Client(host, 8899)
+    client = Client.for_host(host, 8899)
     await client.connect()
     watcher = _ErrorResponseWatcher(client.plant)
     watcher.install()

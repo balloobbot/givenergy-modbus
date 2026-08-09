@@ -58,8 +58,7 @@ from givenergy_modbus.model import TimeSlot
 from givenergy_modbus.model.inverter import Model
 
 async def main():
-    client = Client(host="192.168.99.99", port=8899)
-    await client.connect()
+    client = Client.for_host(host="192.168.99.99", port=8899)
 
     # Detect the topology once, then read the config banks (needed for slot_map)
     await client.detect()

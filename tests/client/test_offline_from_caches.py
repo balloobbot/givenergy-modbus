@@ -40,7 +40,7 @@ _DETECT = dict(timeout=1.0, retries=0, probe_timeout=0.1, probe_retries=0)
 async def _client_for(relpath: str) -> AsyncIterator[Client]:
     mock = MockPlant.from_capture(_CAPTURES / relpath)
     host, port = await mock.start("127.0.0.1", 0)
-    client = Client(host, port, tx_message_wait=0, tx_jitter=0)
+    client = Client.for_host(host, port, tx_message_wait=0, tx_jitter=0)
     await client.connect()
     try:
         yield client

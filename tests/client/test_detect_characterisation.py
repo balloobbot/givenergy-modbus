@@ -121,7 +121,7 @@ async def test_detect_wire_sequence_is_bit_identical(relpath: str):
     """detect() over each fixture issues exactly the recorded outbound request sequence."""
     mock = MockPlant.from_capture(_CAPTURES / relpath)
     host, port = await mock.start("127.0.0.1", 0)
-    client = Client(host, port, tx_message_wait=0, tx_jitter=0)
+    client = Client.for_host(host, port, tx_message_wait=0, tx_jitter=0)
     await client.connect()
     recorded = _tap_outbound(client)
     try:

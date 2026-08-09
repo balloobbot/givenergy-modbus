@@ -60,7 +60,7 @@ async def _set_limit(client: Client, val: int) -> None:
 
 
 async def main(host: str) -> None:
-    client = Client(host, 8899)
+    client = Client.for_host(host, 8899)
     await client.connect()
     try:
         caps = await client.detect()

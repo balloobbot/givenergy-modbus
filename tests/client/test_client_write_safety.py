@@ -31,7 +31,7 @@ _EMS_REG = 2040
 
 
 def _client(caps: PlantCapabilities | None) -> Client:
-    c = Client("localhost", 8899)
+    c = Client.for_host("localhost", 8899)
     c.plant.capabilities = caps
     return c
 

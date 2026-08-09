@@ -2,12 +2,22 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, NamedTuple
 
+from modbus_connection import ModbusConnectionError, ModbusError
+
 if TYPE_CHECKING:
     from givenergy_modbus.model.plant import Plant
 
 
-class ExceptionBase(Exception):
-    """Base exception."""
+class ExceptionBase(ModbusError):
+    """Base exception.
+
+    Rooted at ``modbus_connection.ModbusError`` so a consumer written against the
+    library's exception hierarchy catches everything this library raises without
+    having to know GivEnergy's own names — the transport in
+    :mod:`givenergy_modbus.connection` is a ``modbus_connection`` backend, and a
+    backend that raised exceptions outside that hierarchy would not be a drop-in
+    one.
+    """
 
     message: str
 
@@ -38,15 +48,26 @@ class CommunicationError(ExceptionBase):
     """Exception to indicate a communication error."""
 
 
-class ConnectionLost(CommunicationError, TimeoutError):
+class ConnectionFailed(CommunicationError, ModbusConnectionError):
+    """A connection to the dongle could not be established at all.
+
+    Distinct from :class:`ConnectionLost`, which is a link that was up and went
+    away. Both are ``modbus_connection.ModbusConnectionError`` because both mean
+    "the link is not usable", which is the distinction that library's contract
+    draws; ``CommunicationError`` keeps the historical name working.
+    """
+
+
+class ConnectionLost(CommunicationError, ModbusConnectionError, TimeoutError):
     """The TCP connection dropped mid-operation (peer disconnect, half-open stall).
 
-    Deliberately inherits BOTH CommunicationError and TimeoutError (#356): the
-    dual base is a compatibility contract, not an accident. Consumers that catch
-    bare ``TimeoutError`` (the historical error type for a dead connection) see
-    no behaviour change; consumers may catch ``ConnectionLost`` explicitly —
-    ordered before ``TimeoutError`` — to opt into immediate-reconnect policy.
-    Do not "simplify" to a single base.
+    Deliberately inherits all three bases (#356): they are a compatibility
+    contract, not an accident. Consumers that catch bare ``TimeoutError`` (the
+    historical error type for a dead connection) see no behaviour change;
+    consumers may catch ``ConnectionLost`` explicitly — ordered before
+    ``TimeoutError`` — to opt into immediate-reconnect policy; and
+    ``modbus_connection.ModbusConnectionError`` makes it the link-is-down error
+    the library's own contract names. Do not "simplify" to a single base.
     """
 
 

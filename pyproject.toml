@@ -14,7 +14,6 @@ classifiers = [
     "Natural Language :: English",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
@@ -22,9 +21,10 @@ classifiers = [
     "Topic :: Scientific/Engineering",
     "Topic :: System :: Networking :: Monitoring",
 ]
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
     "crccheck>=1.1,<2",
+    "modbus-connection>=4.3,<5",
     "pydantic>=2.0,<3",
     "typing-extensions>=4.9",
 ]
@@ -73,7 +73,7 @@ include = ["/givenergy_modbus", "/tests"]
 
 [tool.ruff]
 line-length = 120
-target-version = "py311"
+target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "W", "F", "I", "D", "C90"]
@@ -148,11 +148,10 @@ filterwarnings = [
 legacy_tox_ini = """
 [tox]
 isolated_build = true
-envlist = py311, py312, py313, py314, format, lint, build
+envlist = py312, py313, py314, format, lint, build
 
 [gh-actions]
 python =
-    3.11: py311
     3.12: py312
     3.13: py313
     3.14: py314, format, lint, build

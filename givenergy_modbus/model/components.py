@@ -51,15 +51,7 @@ from collections.abc import Callable, Iterable, Sequence
 from enum import Enum
 from typing import Any
 
-from modbus_connection.model import (
-    Component,
-    ComponentGroup,
-    Range,
-    RawField,
-    RegisterField,
-    RegisterSpace,
-    raw_register,
-)
+from modbus_connection.model import Component, ComponentGroup, Range, RegisterField, RegisterSpace
 
 from givenergy_modbus.connection import MAX_REGISTERS_PER_READ
 from givenergy_modbus.model.aio_battery import AioBatteryModuleRegisterGetter
@@ -83,8 +75,7 @@ class GivEnergyField(RegisterField[Any]):
     address + count)``; ``offsets`` picks this field's registers out of it, in
     the order the LUT names them. That covers the reordered pairs and the one
     field with a hole in it, at the cost of reading a register or two nobody
-    wants — which is free, since they sit inside a page the device serves as a
-    unit anyway.
+    wants.
     """
 
     def __init__(
@@ -200,7 +191,6 @@ def component_class(
         "max_span": MAX_REGISTERS_PER_READ,
     }
     readable = {address for low, high in ranges for address in range(low, high + 1)}
-    covered: set[int] = set()
     for field_name, definition in getter.REGISTER_LUT.items():
         if not all(isinstance(register, register_class) for register in definition.registers):
             continue
@@ -211,48 +201,24 @@ def component_class(
                 f"{name}.{field_name} reads {sorted(window - readable)}, outside the declared readable ranges {ranges}"
             )
         namespace[field_name] = field
-        covered |= window
-    namespace.update(_page_anchors(ranges, covered))
     return type(name, (Component,), namespace)
-
-
-def _page_anchors(ranges: tuple[Range, ...], covered: set[int]) -> dict[str, RawField]:
-    """Placeholder fields pinning each block to the whole page the device serves.
-
-    GivEnergy answers a read as a page: the dongle's own traffic only ever asks
-    for a bank's full width from its origin. The planner sizes a block to the
-    fields in it, so a page whose first modelled register is not its first
-    register would be read from the wrong base — ``HR(242, 58)`` where the
-    hardware expects ``HR(240, 60)``.
-
-    ``register_ranges`` is the natural place to say "this device answers in
-    fixed pages", but it only declares which addresses are *readable*, not where
-    a block may start. Until it does, an unused raw field at each end of a range
-    pulls the block out to the page boundary. They read as ``None`` and are
-    filtered out of a component's modelled fields by their leading underscore.
-    """
-    anchors: dict[str, RawField] = {}
-    for low, high in ranges:
-        for address in (low, high):
-            if address not in covered:
-                anchors[f"_page_anchor_{address}"] = raw_register(address)
-    return anchors
 
 
 # ---------------------------------------------------------------------------
 # Readable address maps
 #
 # Stated as data rather than derived from the field addresses, because they are
-# a claim about the *hardware*: these are the banks the device answers, in the
-# page-aligned shape it answers them in. Where a family is polled by the client,
-# the ranges match the banks in ``manifest`` and ``client._refresh_banks``
-# exactly, so a component's read plan reproduces the library's own request
-# pattern. Where it is not — HR(180-239), HR(4107+), IR(240-248) — the range
-# comes from the LUT's own belief about what lives there.
+# a claim about the *hardware*: these are the banks the device answers. They
+# matter to planning in two ways — a block never spans two ranges, so an
+# unreadable gap is never read across, and each range is planned as one block
+# regardless of how far apart its fields sit.
 #
-# ``tests/model/test_components.py`` asserts both halves of that: every field is
-# covered, and the plan a component builds is the request pattern the client
-# already makes.
+# The hardware is not fussy about where a block starts: captures show it serving
+# HR(1110,1), HR(1120,5), IR(1360,54) and a run of single-register reads from
+# IR(2044) upward, so the planner is free to trim a block to the fields in it.
+# Ranges are stated at the granularity of the banks in ``manifest`` and
+# ``client._refresh_banks`` because that is the granularity the device serves or
+# refuses as a unit, which is what ``bank_components`` keys on.
 # ---------------------------------------------------------------------------
 
 _INVERTER_HOLDING: tuple[Range, ...] = (
@@ -435,7 +401,7 @@ INPUT_ONLY_FAMILIES: dict[str, type[Component]] = {
 
 
 def modelled_fields(component: Component) -> dict[str, GivEnergyField]:
-    """A component's live device fields, without the page anchors.
+    """A component's live device fields.
 
     Reads ``_register_fields`` rather than ``declared_fields`` because the
     public mapping is the *class's* declared layout and ``restrict_fields``

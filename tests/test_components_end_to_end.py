@@ -170,4 +170,6 @@ async def test_a_narrowed_group_reads_the_client_s_own_request_pattern(connectio
     input_reads = sorted(base for name, base, _ in reads if "Input" in name)
     assert holding_reads == [0, 60, 120]
     assert input_reads == [0, 180]
-    assert all(count == 60 for _, _, count in reads)
+    # One block per bank, each trimmed to the registers modelled in it and well
+    # inside the device's 60-register read limit.
+    assert all(0 < count <= 60 for _, _, count in reads)

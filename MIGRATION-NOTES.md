@@ -2,7 +2,7 @@
 
 A survey of ~65 real-world Modbus libraries classified this one **BLOCKED**: a custom "Transparent" framer with an embedded device serial and its own CRC, a mandatory dongle heartbeat, a transmit throttle, FC06-only writes, and last-good data served on a rejected read. The survey's answer to that class of library was that `modbus-connection`'s pure Protocol layer — `ModbusConnection` and the `ModbusUnit` Protocol, neither of which imports a backend — *is* the extension seam, and that such a library needs no library work at all.
 
-This migration tests that claim. The verdict up front: **the transport seam holds completely, and the model framework holds for 1253 of 1260 register definitions.** Nothing in `modbus-connection` had to change, and nothing needed to. Four things had to be reached around — all of them things the shipped backends reach around too — and one genuine gap cost ugly code. Details below.
+This migration tests that claim. The verdict up front: **the transport seam holds completely, and the model framework holds for 1253 of 1260 register definitions.** Nothing in `modbus-connection` had to change, and nothing needed to. Four things had to be reached around — all of them things the shipped backends reach around too — and no gap survived checking as a blocker. Details below, including two findings I withdrew once I measured them.
 
 Where this landed:
 
@@ -11,7 +11,7 @@ Where this landed:
 | `givenergy_modbus/connection.py` | 890 lines — the transport as a `ModbusConnection` backend |
 | `givenergy_modbus/model/components.py` | 506 lines — every device family as a `Component` |
 | `givenergy_modbus/client/client.py` | −471 / +183 lines: the socket, the pump tasks and the retry loop moved out |
-| tests | 1765 passing, including the model layer driven end to end over real framing |
+| tests | 1766 passing, including the model layer driven end to end over real framing |
 
 ---
 
@@ -86,6 +86,29 @@ This turns out to be the established pattern rather than a hole: tmodbus's `_on_
 
 `givenergy_modbus.exceptions.ExceptionBase` now derives from `modbus_connection.ModbusError`, and `ConnectionLost` / `ConnectionFailed` are also `ModbusConnectionError`. Not strictly forced, but a backend that raises outside the library's hierarchy is not a drop-in backend. `ConnectionLost` now has three bases (`CommunicationError`, `ModbusConnectionError`, `TimeoutError`) so the historical `except TimeoutError` contract still holds.
 
+### What we should have done differently: `asyncio.Protocol`, not `StreamReader`
+
+The transport detects a dropped link by polling `reader.at_eof()` around
+`reader.read()`, plus a `_DRAIN_TIMEOUT` watchdog on `writer.drain()` to catch a
+half-open peer, plus a manual `writer.close()` when a loss is noticed. That is
+three mechanisms doing the job of one, and it is the reason a lost session
+leaked its socket until a test hung on it.
+
+It is that way because the pre-migration `Client` was built on
+`asyncio.open_connection`, and the migration moved that code rather than
+reconsidering it. tmodbus does it properly: `ModbusTcpProtocol` is an
+`asyncio.Protocol`, so `connection_lost(exc)` fires on reset, error and clean
+close alike, the transport closes itself, and there is no drain watchdog because
+`transport.write()` doesn't block.
+
+**Why not just use tmodbus's transport, then?** Because it isn't separable from
+its framing: `ModbusTcpProtocol` builds MBAP headers inline and keys
+`_pending_requests` by transaction id. GivEnergy pins the transaction id to a
+constant, so every request would collide on the same key — the correlator is the
+one thing that cannot be reused here. The right fix is our own
+`asyncio.Protocol` subclass, not a `StreamReader` loop; it would delete the
+watchdog, the manual close and the EOF polling. Worth doing, and not done here.
+
 ### What we did *not* need
 
 No fork, no vendored copy, no patched planner, no reimplemented `Component`. The retry loop, the heartbeat responder and the frame reassembly all live in our own module and the library never sees them — which is the seam working.
@@ -94,7 +117,7 @@ No fork, no vendored copy, no patched planner, no reimplemented `Component`. The
 
 ## 3. What could modbus-connection do better?
 
-Ordered by how much each one cost. (a) and (b) are corrections: my first pass overstated both, and checking them against the shipped backends and against a measurement deflated them.
+Ordered by how much each one cost. (a), (b) and (c) are corrections — my first pass overstated all three, and checking each against the shipped backends, a measurement and the wire captures deflated them. They are kept rather than deleted because the reasoning that produced them is the interesting part.
 
 ### a. Reporting connection loss is copy-pasted into every backend
 
@@ -121,13 +144,15 @@ So: not a bug, and the workaround is free. What remains is a documentation gap �
 
 **Fix:** document the rule. If anything more, an opt-in `async_update(partial=True)` that sets a refused block's fields to `None` and reports the failed `ReadBlock`s would let a device be modelled per family *and* tolerate absent banks — but it is a convenience, not a necessity.
 
-### c. `register_ranges` says what's readable, not where a block may start
+### c. ~~Blocks must start at a page boundary~~ — withdrawn, I was wrong
 
-GivEnergy answers in fixed pages. The dongle's own traffic only ever asks for a bank's whole width from its origin — `IR(60,60)`, `IR(60,30)`, `HR(240,60)`. The planner sizes a block to the fields inside it, so a page whose first *modelled* register is not its first register gets read from the wrong base: we got `HR(242,58)` where the hardware expects `HR(240,60)`, and `IR(1001,20)` where it expects `IR(1000,60)`.
+I originally claimed the planner's block *trimming* was a gap: GivEnergy's own traffic only ever asks for whole banks, so `HR(242,58)` where the client sends `HR(240,60)` looked unsafe, and I worked around it with placeholder `raw_register` fields at every range boundary.
 
-`register_ranges` is exactly where "this device answers in fixed pages" belongs, and it only declares which addresses are readable. The workaround is a hack: an unused `raw_register` at each end of every range, purely to pull the block out to the page boundary. It works — the planned reads now match the client's own request pattern exactly — but 11 device families carry placeholder fields that exist to defeat an optimisation.
+The captures disagree. Decoding every recorded response and keeping the successful ones, the hardware serves `HR(1110,1)`, `HR(1112,1)`, `HR(1122,1)`, `HR(1120,5)`, `IR(1360,54)`, `IR(1840,20)`, `IR(300,21)` and a run of single-register reads from `IR(2044)` to `IR(2070)`. Arbitrary base, arbitrary count, within the 60-register cap. The only refusals are absent *banks* (`236,60`, `1100,60` — a three-phase range on a device that lacks it), which is about the bank existing, not about alignment.
 
-**Fix:** a `read_whole_range: bool` on `Component` (or a per-range flag), meaning "read each declared range in full rather than trimming to fields". Cheap to implement, and this is not an exotic device: any gateway or dongle that re-exposes a cached page has the same property.
+So trimming is fine, the anchors are deleted, and the reads are now *narrower* than the client's own — `IR(60,56)` for a BMS instead of `IR(60,60)`, `IR(60,29)` for a meter instead of `IR(60,30)`. `test_the_hardware_serves_arbitrary_bases_and_counts` pins the evidence so the next person doesn't re-derive the same wrong conclusion from the same misleading traffic pattern.
+
+**Nothing to fix.** Worth recording as the one place the migration nearly baked a false hardware assumption into the model, on the strength of "all observed traffic looks like X" — which is evidence about the *client*, not the *device*.
 
 ### d. `Component` is single-space, and a device usually isn't
 
@@ -194,4 +219,6 @@ Worth saying plainly, because it is most of the story:
 
 **With one caveat the survey didn't name:** the seam is sufficient for *request/response*, and GivEnergy dongles also volunteer frames. The heartbeat has to be answered, LAN-config broadcasts arrive unbidden, and a shared dongle delivers another consumer's register responses — all carrying data as current as our own. The Protocol has no room for any of it, so `GivEnergyConnection` grew `add_frame_listener()`. That is not a defect in the Protocol — it should stay request/response — but it does mean "implement `ModbusUnit` and you're done" is only true for devices that speak when spoken to. A backend for a chatty device will always need a second, native surface, and the docs should say so.
 
-**The model framework: also yes, with one blocker and one modelling rule.** 1253 of 1260 fields translate, and the planned reads match the library's own request pattern exactly. The blocker is (c) — a component that can't be told to read whole pages will ask a page-oriented device for the wrong base, and the placeholder-field workaround is ugly. The rule is (b): size a component to the device's failure granularity and poll independently-failing components separately. Nothing forced a library change there either; it just isn't written down anywhere, and the obvious modelling is the wrong one.
+**The model framework: also yes, with one modelling rule.** 1253 of 1260 fields translate, and the planner's reads are narrower than the library's own hand-written ones. Two things I first called blockers weren't: (b) is a modelling rule — size a component to the device's failure granularity, and poll independently-failing components separately — and (c) was me mistaking the client's habits for the device's requirements. What's left is (d) through (i): real but small, and none of them stopped anything.
+
+The pattern in both mistakes is worth naming: I generalised from what this library's *existing code* does, rather than from what the *device* accepts. The captures were sitting right there and settled both questions in one query each.

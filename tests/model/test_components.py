@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 from modbus_connection.mock import MockModbusConnection, MockModbusUnit
 
+from givenergy_modbus.framer import ClientFramer
 from givenergy_modbus.model.aio_battery import AioBatteryModuleRegisterGetter
 from givenergy_modbus.model.battery import BatteryRegisterGetter
 from givenergy_modbus.model.components import (
@@ -32,7 +33,8 @@ from givenergy_modbus.model.inverter_threephase import ThreePhaseInverterRegiste
 from givenergy_modbus.model.meter import MeterProductRegisterGetter, MeterRegisterGetter
 from givenergy_modbus.model.register import HR, IR
 from givenergy_modbus.model.register_cache import RegisterCache
-from givenergy_modbus.testing.mock_plant import plant_from_capture
+from givenergy_modbus.pdu import ReadRegistersResponse
+from givenergy_modbus.testing.mock_plant import _iter_capture_frames, plant_from_capture
 
 CAPTURES = Path(__file__).parent.parent / "fixtures" / "captures"
 
@@ -129,26 +131,32 @@ async def test_reads_stay_within_the_device_read_limit(capture, address, family,
     assert not oversized, f"blocks wider than the device accepts: {oversized}"
 
 
-async def test_a_battery_is_exactly_one_page_read():
-    """The planner reproduces the client's own request for a BMS: IR(60,60), once."""
+async def test_a_battery_is_one_read_of_its_own_bank():
+    """A BMS is a single block, trimmed to the registers actually modelled.
+
+    The client polls this bank as IR(60,60); the planner trims to IR(60,56)
+    because nothing is modelled above IR(115). The device serves either — its
+    own traffic includes reads as narrow as one register at an arbitrary base —
+    so trimming is free and the narrower read is strictly better.
+    """
     unit = MockModbusConnection().for_unit(0x32)
     _seed(unit, _cache("hybrid_2_bat_a", 0x32))
     _, group = components_for("battery", unit)
 
     await group.async_update()
 
-    assert [(e.register_type, e.address, e.count) for e in unit.read_events] == [("input", 60, 60)]
+    assert [(e.register_type, e.address, e.count) for e in unit.read_events] == [("input", 60, 56)]
 
 
-async def test_a_meter_is_the_client_s_own_thirty_register_read():
-    """A meter's fields sit in IR(60-88), which the client polls as IR(60,30)."""
+async def test_a_meter_is_one_trimmed_read():
+    """A meter's fields sit in IR(60-88); the client polls IR(60,30), we read IR(60,29)."""
     unit = MockModbusConnection().for_unit(0x03)
     _seed(unit, _cache("aio_a", 0x03))
     _, group = components_for("meter", unit)
 
     await group.async_update()
 
-    assert [(e.address, e.count) for e in unit.read_events] == [(60, 30)]
+    assert [(e.address, e.count) for e in unit.read_events] == [(60, 29)]
 
 
 async def test_a_split_family_reads_both_register_spaces():
@@ -222,6 +230,30 @@ async def test_a_restricted_component_reads_only_the_banks_it_kept():
     await component.async_update()
 
     assert all(event.address < 60 for event in unit.read_events), unit.read_events
+
+
+async def test_the_hardware_serves_arbitrary_bases_and_counts():
+    """Why the planner is allowed to trim a block to the fields inside it.
+
+    The client's own poll only ever asks for whole banks, which makes it look as
+    though the device answers in fixed pages and a trimmed read would be
+    refused. The captures say otherwise: every recorded response echoes the
+    shape it was asked for, and the successful ones include single registers at
+    arbitrary bases and a range of odd counts. So a narrower block is safe, and
+    the planner's trimming is a straightforward win.
+    """
+    served: set[tuple[int, int]] = set()
+    for capture in CAPTURES.iterdir():
+        for log in capture.glob("*.log"):
+            framer = ClientFramer()
+            for frame in _iter_capture_frames(log):
+                async for pdu in framer.decode(frame):
+                    if isinstance(pdu, ReadRegistersResponse) and not pdu.error:
+                        served.add((pdu.base_register, pdu.register_count))
+
+    unaligned = {base for base, _ in served if base % 60}
+    assert unaligned >= {1110, 1122, 2044, 2070}, f"expected odd bases to be served, got {sorted(unaligned)}"
+    assert {count for _, count in served} >= {1, 5, 20, 21, 30, 54, 60}
 
 
 def test_meter_product_registers_have_no_component():

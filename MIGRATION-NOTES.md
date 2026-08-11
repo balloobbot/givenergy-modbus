@@ -4,7 +4,7 @@ A survey of ~65 real-world Modbus libraries classified this one **BLOCKED**: a c
 
 This migration tests that claim. The verdict up front: **the transport seam holds completely, and the model framework holds for 1253 of 1260 register definitions.** Nothing in `modbus-connection` had to change, and nothing needed to. Three things had to be reached around — all of them things the shipped backends reach around too — and no gap survived checking as a blocker. Details below, including two findings I withdrew once I measured them.
 
-Written against 4.3, revised on the move to **4.4**, which closed one of the findings below — (i), the live field set — outright. Where a finding changed, the note says so rather than being deleted.
+Written against 4.3, revised on the move to **4.4**, which closed one of the findings below — (i), the live field set — outright, and again on the move to **4.5**, which reopened (b) from the other end: a `ComponentGroup` now merges readable ranges that touch, and every GivEnergy bank touches its neighbour. Where a finding changed, the note says so rather than being deleted.
 
 Where this landed:
 
@@ -138,11 +138,17 @@ One thing genuinely differs for a self-detecting backend: tmodbus and pymodbus a
 
 `ReadPlan.execute` re-raises a refused block and discards the pass. My first framing of this as the biggest model-layer gap was wrong: it's the correct all-or-nothing default, and modelling per *bank* rather than per *device family* fits GivEnergy exactly, because a bank is precisely what this hardware succeeds or fails at — it serves a page whole or refuses it whole.
 
-`bank_components()` does that, and `tests/.../test_per_bank_components_isolate_a_refused_bank` measures the cost: eleven components, **eleven reads** — byte-for-byte what a single pooled plan would have issued, because the banks are disjoint pages that could never have been merged. The three served banks decode; the eight refused ones fail alone. The only real constraint is that you must poll them individually: putting them back in a `ComponentGroup` pools them into one plan, and one plan fails as a whole.
+`bank_components()` does that, and `tests/.../test_per_bank_components_isolate_a_refused_bank` measures the cost: eleven components, **eleven reads** — byte-for-byte what a single pooled plan would have issued, because the banks are disjoint pages. The three served banks decode; the eight refused ones fail alone. The only real constraint is that you must poll them individually: putting them back in a `ComponentGroup` pools them into one plan, and one plan fails as a whole.
 
 So: not a bug, and the workaround is free. What remains is a documentation gap — nothing says "size a component to your device's failure granularity, and don't group components that can fail independently". That is a non-obvious modelling rule, and the natural instinct (one component per device) is the wrong one for any device with capability-gated banks.
 
 **Fix:** document the rule. If anything more, an opt-in `async_update(partial=True)` that sets a refused block's fields to `None` and reports the failed `ReadBlock`s would let a device be modelled per family *and* tolerate absent banks — but it is a convenience, not a necessity.
+
+**4.5 sharpens this into a real constraint.** `DeviceRanges.merged` now coalesces maps that *touch*, so any component whose map passes through a `ComponentGroup` gets its banks joined into one run — and GivEnergy's banks all touch, because the pages are contiguous. Measured across the eleven families, that turned seven bank-aligned blocks into blocks spanning two banks (`HR(199,59)` crosses 239|240, `HR(258,60)` crosses 299|300, gateway `IR(1700,59)` crosses 1719|1720, and so on), for a net saving of **one request** — on the gateways, and nowhere else. Nothing in the captures shows this hardware answering a read across a bank boundary; the one refusal recorded at an unaligned base, `IR(236,60)` at `0x32`, is exactly that shape.
+
+Neither escape hatch the library offers applies. A **deliberate gap** needs an address no field claims between two banks, and `HR(299)` and `HR(300)` are both modelled — the pages abut with fields on either side of the seam. **`max_span`** is a width cap, not an alignment rule; no value of it stops a 60-register block starting at 258. What does hold the split is that a component's *own* map is never coalesced, so `components_for()` stopped returning a `ComponentGroup` and `read_components()` drives each component's own plan. That restores the 4.4 request pattern exactly, for every family, whole and per bank, and `test_no_planned_block_crosses_a_bank_boundary` pins it.
+
+**Fix:** a component-level way to say "this map's parts are separate reads" — the thing `register_ranges` meant before 4.5. A group that can only ever merge its members' maps cannot model a device whose readable pages are contiguous but independently served, which is most capability-gated hardware.
 
 ### c. ~~Blocks must start at a page boundary~~ — withdrawn, I was wrong
 
@@ -156,7 +162,7 @@ So trimming is fine, the anchors are deleted, and the reads are now *narrower* t
 
 ### d. `Component` is single-space, and a device usually isn't
 
-`register_space` is one of `"holding"` or `"input"` per component, but 3 of 11 families here (both inverters and the EMS) declare registers in both. Each becomes *two* components pooled by a `ComponentGroup` — which works correctly, and the range merging even does the right thing — but "an inverter" is now two objects and a group, for no reason the device would recognise.
+`register_space` is one of `"holding"` or `"input"` per component, but 3 of 11 families here (both inverters and the EMS) declare registers in both. Each becomes *two* components — "an inverter" is two objects, for no reason the device would recognise. They were pooled by a `ComponentGroup` until 4.5; the group never saved a request, since the two members address different spaces and blocks are planned per space, and 4.5's range merging made it cost bank boundaries (see (b)), so the pooling is gone.
 
 **Fix:** let a field carry its own space, defaulting to the component's. The planner already keys blocks by space; the change is in field declaration, not planning.
 

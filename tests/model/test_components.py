@@ -26,6 +26,7 @@ from givenergy_modbus.model.components import (
     bank_components,
     components_for,
     modelled_fields,
+    read_components,
     restrict_to_banks,
 )
 from givenergy_modbus.model.ems import EmsRegisterGetter
@@ -105,8 +106,8 @@ async def test_component_agrees_with_the_pydantic_model(capture, address, family
     unit = MockModbusConnection().for_unit(address)
     served = _seed(unit, cache)
 
-    components, group = components_for(family, unit)
-    await group.async_update()
+    components = components_for(family, unit)
+    await read_components(components)
 
     expected = getter(cache).build()
     compared = 0
@@ -125,9 +126,9 @@ async def test_reads_stay_within_the_device_read_limit(capture, address, family,
     """No planned block exceeds the 60 registers GivEnergy's read function accepts."""
     unit = MockModbusConnection().for_unit(address)
     _seed(unit, _cache(capture, address))
-    _, group = components_for(family, unit)
+    components = components_for(family, unit)
 
-    await group.async_update()
+    await read_components(components)
 
     assert unit.read_events, "the component planned no reads at all"
     oversized = [event for event in unit.read_events if event.count > MAX_REGISTERS_PER_READ]
@@ -144,9 +145,9 @@ async def test_a_battery_is_one_read_of_its_own_bank():
     """
     unit = MockModbusConnection().for_unit(0x32)
     _seed(unit, _cache("hybrid_2_bat_a", 0x32))
-    _, group = components_for("battery", unit)
+    components = components_for("battery", unit)
 
-    await group.async_update()
+    await read_components(components)
 
     assert [(e.register_type, e.address, e.count) for e in unit.read_events] == [("input", 60, 56)]
 
@@ -155,20 +156,20 @@ async def test_a_meter_is_one_trimmed_read():
     """A meter's fields sit in IR(60-88); the client polls IR(60,30), we read IR(60,29)."""
     unit = MockModbusConnection().for_unit(0x03)
     _seed(unit, _cache("aio_a", 0x03))
-    _, group = components_for("meter", unit)
+    components = components_for("meter", unit)
 
-    await group.async_update()
+    await read_components(components)
 
     assert [(e.address, e.count) for e in unit.read_events] == [(60, 29)]
 
 
 async def test_a_split_family_reads_both_register_spaces():
-    """An inverter's two components address FC03 and FC04 through one group call."""
+    """An inverter's two components address FC03 and FC04 from one call."""
     unit = MockModbusConnection().for_unit(0x31)
     _seed(unit, _cache("hybrid_2_bat_a", 0x31))
-    _, group = components_for("inverter", unit)
+    components = components_for("inverter", unit)
 
-    await group.async_update()
+    await read_components(components)
 
     spaces = {event.register_type for event in unit.read_events}
     assert spaces == {"holding", "input"}
@@ -182,17 +183,42 @@ async def test_every_declared_layout_plans(family):
     readable map cannot contain — outside every range, or straddling two, which
     is unreadable because a block never crosses a boundary. ``component_class``
     applies the same rule at import; this asks the library itself, for every
-    family, both pooled and per bank. An unseeded mock answers zeros, so the
-    plan building is the whole point of the update.
+    family, whole and per bank. An unseeded mock answers zeros, so the plan
+    building is the whole point of the update.
     """
     unit = MockModbusConnection().for_unit(1)
-    _, group = components_for(family, unit)
+    components = components_for(family, unit)
 
-    await group.async_update()
+    await read_components(components)
     for component in bank_components(family, unit).values():
         await component.async_update()
 
     assert unit.read_events, "the family planned no reads at all"
+
+
+@pytest.mark.parametrize("family", sorted(set(SPLIT_FAMILIES) | set(INPUT_ONLY_FAMILIES)))
+async def test_no_planned_block_crosses_a_bank_boundary(family):
+    """A block stays inside one bank, because a bank is what the device serves.
+
+    GivEnergy's banks touch — HR(0-59) runs straight into HR(60-119) — and since
+    modbus-connection 4.5 touching ranges describe one readable run, so anything
+    that merges the maps lets a block span two banks. No capture shows the
+    hardware answering a read across a boundary, and the one refusal recorded at
+    an unaligned base is exactly that shape, so the boundaries are load-bearing
+    until something proves otherwise.
+    """
+    unit = MockModbusConnection().for_unit(1)
+    components = components_for(family, unit)
+
+    await read_components(components)
+
+    banks_by_space = {component.register_space: component.register_ranges for component in components}
+    for event in unit.read_events:
+        low, high = event.address, event.address + event.count - 1
+        banks = banks_by_space[event.register_type]
+        assert any(bank[0] <= low and high <= bank[1] for bank in banks), (
+            f"{family} reads {event.register_type} {low}-{high}, which spans two of {banks}"
+        )
 
 
 def test_non_contiguous_and_reordered_fields_survive_translation():
@@ -237,24 +263,42 @@ def test_restrict_to_banks_narrows_a_component_to_what_a_model_serves():
     assert max(field.address for field in modelled_fields(component).values()) < 60
 
 
-async def test_narrowing_a_pooled_member_reshapes_the_group_s_plan():
+async def test_dropping_one_of_two_fields_sharing_a_register_keeps_it_readable():
+    """The LUT names the same register under two names 30 times over.
+
+    ``device_type_code`` and ``model`` are both HR(0); ``dsp_firmware_version``
+    and ``firmware_version`` both read HR(19). Keeping one and dropping its twin
+    used to mark the shared address unreadable and fail the plan, which is why
+    only whole banks could be narrowed away. A kept field reading an address is
+    now proof the device serves it.
+    """
+    unit = MockModbusConnection().for_unit(1)
+    component = InverterHolding(unit)
+
+    component.restrict_fields(["model", "firmware_version"])
+    await component.async_update()
+
+    assert [(e.address, e.count) for e in unit.read_events] == [(0, 1), (19, 3)]
+
+
+async def test_narrowing_a_member_after_the_first_poll_reshapes_its_plan():
     """Capability gating can land after the first poll, and still take effect.
 
     ``detect()`` establishes the served banks, but a consumer may already have
-    polled a family's group by then. Narrowing a member drops the pooled plan it
-    is part of, so the next group read is the narrowed one rather than the plan
-    cached before the restriction.
+    polled a family by then. Narrowing a component drops the plan it cached, so
+    the next read is the narrowed one rather than the plan built before the
+    restriction.
     """
     unit = MockModbusConnection().for_unit(0x31)
     _seed(unit, _cache("hybrid_2_bat_a", 0x31))
-    components, group = components_for("inverter", unit)
+    components = components_for("inverter", unit)
     holding, _ = components
-    await group.async_update()
+    await read_components(components)
     assert any(event.register_type == "holding" and event.address >= 60 for event in unit.read_events)
 
     restrict_to_banks(holding, [(0, 59)])
     unit.read_events.clear()
-    await group.async_update()
+    await read_components(components)
 
     holding_reads = [event for event in unit.read_events if event.register_type == "holding"]
     assert holding_reads and all(event.address < 60 for event in holding_reads), holding_reads

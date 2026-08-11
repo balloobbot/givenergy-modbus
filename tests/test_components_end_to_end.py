@@ -21,6 +21,7 @@ from givenergy_modbus.model.components import (
     bank_components,
     components_for,
     modelled_fields,
+    read_components,
     restrict_to_banks,
 )
 from givenergy_modbus.pdu import ReadRegistersResponse
@@ -146,10 +147,10 @@ async def test_narrowing_to_the_detected_banks_makes_the_read_work(connection):
     assert modelled_fields(inverter)
 
 
-async def test_a_narrowed_group_reads_the_client_s_own_request_pattern(connection):
-    """The pooled plan reproduces the banks the client polls, and nothing else."""
+async def test_narrowed_components_read_the_client_s_own_request_pattern(connection):
+    """The planned reads reproduce the banks the client polls, and nothing else."""
     unit = connection.for_unit(INVERTER)
-    components, group = components_for("inverter", unit)
+    components = components_for("inverter", unit)
     holding, input_registers = components
     restrict_to_banks(holding, HYBRID_HOLDING_BANKS)
     restrict_to_banks(input_registers, [(0, 59), (180, 239)])
@@ -164,7 +165,7 @@ async def test_a_narrowed_group_reads_the_client_s_own_request_pattern(connectio
             else None
         )
     )
-    await group.async_update()
+    await read_components(components)
 
     holding_reads = sorted(base for name, base, _ in reads if "Holding" in name)
     input_reads = sorted(base for name, base, _ in reads if "Input" in name)

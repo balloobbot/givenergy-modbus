@@ -51,7 +51,7 @@ from collections.abc import Callable, Iterable, Sequence
 from enum import Enum
 from typing import Any
 
-from modbus_connection.model import Component, ComponentGroup, Range, RegisterField, RegisterSpace
+from modbus_connection.model import Component, Range, RegisterField, RegisterSpace
 
 from givenergy_modbus.connection import MAX_REGISTERS_PER_READ
 from givenergy_modbus.model.aio_battery import AioBatteryModuleRegisterGetter
@@ -183,7 +183,7 @@ def component_class(
     """Build the Component for one register space of one device family.
 
     Only the LUT entries that live in ``space`` become fields — a family whose
-    registers span both spaces becomes two components, pooled by
+    registers span both spaces becomes two components, built by
     :func:`components_for` (see :class:`Component`'s single ``register_space``).
 
     Raises ``ValueError`` if a field does not fit inside one declared range,
@@ -225,6 +225,12 @@ def component_class(
 # matter to planning in two ways — a block never spans two ranges, so an
 # unreadable gap is never read across, and each range is planned as one block
 # regardless of how far apart its fields sit.
+#
+# The banks touch, and the pages they name are contiguous: HR(299) and HR(300)
+# are both modelled either side of a bank boundary. There is therefore no gap to
+# declare and no ``max_span`` that would keep a block off a boundary — only a
+# component's own map splits these, which is why the family's components are
+# never pooled (see ``components_for``).
 #
 # The hardware is not fussy about where a block starts: captures show it serving
 # HR(1110,1), HR(1120,5), IR(1360,54) and a run of single-register reads from
@@ -428,20 +434,37 @@ def modelled_fields(component: Component) -> dict[str, GivEnergyField]:
     }
 
 
-def components_for(family: str, unit: Any) -> tuple[list[Component], ComponentGroup]:
-    """Build ``family``'s components on ``unit`` and the group that reads them.
+def components_for(family: str, unit: Any) -> list[Component]:
+    """Build ``family``'s components on ``unit``.
 
-    Returns the components and a :class:`ComponentGroup` that pools their reads.
-    A split family's two components address different register spaces, so the
-    group plans each space's blocks separately but drives both from one call.
+    A split family becomes two components, one per register space. Read them
+    with :func:`read_components`, which drives each component's own plan.
+
+    They are deliberately *not* pooled in a
+    :class:`~modbus_connection.model.ComponentGroup`. A group
+    merges its members' maps, and since modbus-connection 4.5 that merge
+    coalesces ranges that touch — which every GivEnergy bank does — so a pooled
+    block is free to span two banks. The device serves or refuses a bank as a
+    unit and no capture shows it answering a read across a boundary, so the
+    banks stay in separate plans. A component's own map is not coalesced, which
+    is what keeps the split.
     """
     if family in SPLIT_FAMILIES:
-        components = [klass(unit) for klass in SPLIT_FAMILIES[family]]
-    elif family in INPUT_ONLY_FAMILIES:
-        components = [INPUT_ONLY_FAMILIES[family](unit)]
-    else:
-        raise KeyError(f"unknown device family {family!r}")
-    return components, ComponentGroup(unit, components)
+        return [klass(unit) for klass in SPLIT_FAMILIES[family]]
+    if family in INPUT_ONLY_FAMILIES:
+        return [INPUT_ONLY_FAMILIES[family](unit)]
+    raise KeyError(f"unknown device family {family!r}")
+
+
+async def read_components(components: Iterable[Component]) -> None:
+    """Refresh each component on its own plan, in order.
+
+    Raises whatever the first refused read raises, leaving the later components
+    unread — the same all-or-nothing a single plan gives, without a plan that
+    spans banks.
+    """
+    for component in components:
+        await component.async_update()
 
 
 def bank_components(family: str, unit: Any) -> dict[tuple[RegisterSpace, Range], Component]:
@@ -457,11 +480,11 @@ def bank_components(family: str, unit: Any) -> dict[tuple[RegisterSpace, Range],
     answer are discarded with it.
 
     Modelling per bank matches the device's own granularity, so a refused page
-    fails only its own component. It costs nothing in traffic: the banks are
-    disjoint pages, so a pooled plan could never have merged them into fewer
-    reads anyway. Poll the components individually — putting them in a
-    :class:`ComponentGroup` would pool them back into a single plan, and a
-    single plan fails as a whole.
+    fails only its own component. It costs nothing in traffic: each bank is one
+    block either way. Poll the components individually — putting them in a
+    :class:`~modbus_connection.model.ComponentGroup` would pool them back into a
+    single plan, which fails as a whole and, since 4.5, merges the touching
+    banks into blocks that span them.
 
     Use this when the served banks are unknown; use :func:`components_for` plus
     :func:`restrict_to_banks` once ``detect()`` has established them.
@@ -522,5 +545,6 @@ __all__ = [
     "component_class",
     "components_for",
     "modelled_fields",
+    "read_components",
     "restrict_to_banks",
 ]

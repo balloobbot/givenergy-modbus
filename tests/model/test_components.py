@@ -16,11 +16,14 @@ from givenergy_modbus.framer import ClientFramer
 from givenergy_modbus.model.aio_battery import AioBatteryModuleRegisterGetter
 from givenergy_modbus.model.battery import BatteryRegisterGetter
 from givenergy_modbus.model.components import (
+    INPUT_ONLY_FAMILIES,
     MAX_REGISTERS_PER_READ,
+    SPLIT_FAMILIES,
     Battery,
     GivEnergyField,
     InverterHolding,
     Meter,
+    bank_components,
     components_for,
     modelled_fields,
     restrict_to_banks,
@@ -171,16 +174,25 @@ async def test_a_split_family_reads_both_register_spaces():
     assert spaces == {"holding", "input"}
 
 
-def test_every_declared_field_is_inside_its_readable_ranges():
-    """A field outside the map would be unreadable; component_class refuses to build one."""
-    for family in ("inverter", "three_phase_inverter", "ems", "battery", "gateway_v2", "hv_bcu"):
-        unit = MockModbusConnection().for_unit(1)
-        components, _ = components_for(family, unit)
-        for component in components:
-            readable = {a for low, high in component.register_ranges for a in range(low, high + 1)}
-            for name, field in modelled_fields(component).items():
-                window = set(range(field.address, field.address + field.count))
-                assert window <= readable, f"{family}.{name} reads outside the declared map"
+@pytest.mark.parametrize("family", sorted(set(SPLIT_FAMILIES) | set(INPUT_ONLY_FAMILIES)))
+async def test_every_declared_layout_plans(family):
+    """The planner is the authority on whether a declared map can be read.
+
+    Since modbus-connection 4.4 the planner refuses a field its component's
+    readable map cannot contain — outside every range, or straddling two, which
+    is unreadable because a block never crosses a boundary. ``component_class``
+    applies the same rule at import; this asks the library itself, for every
+    family, both pooled and per bank. An unseeded mock answers zeros, so the
+    plan building is the whole point of the update.
+    """
+    unit = MockModbusConnection().for_unit(1)
+    _, group = components_for(family, unit)
+
+    await group.async_update()
+    for component in bank_components(family, unit).values():
+        await component.async_update()
+
+    assert unit.read_events, "the family planned no reads at all"
 
 
 def test_non_contiguous_and_reordered_fields_survive_translation():
@@ -218,6 +230,34 @@ def test_restrict_to_banks_narrows_a_component_to_what_a_model_serves():
     assert component.export_priority is None
     kept = {field.address for field in modelled_fields(component).values()}
     assert kept and max(kept) < 180
+
+    # Narrowing again composes: it works from what the instance still reads, not
+    # from the class's declared layout, which restrict_fields never narrows.
+    restrict_to_banks(component, [(0, 59)])
+    assert max(field.address for field in modelled_fields(component).values()) < 60
+
+
+async def test_narrowing_a_pooled_member_reshapes_the_group_s_plan():
+    """Capability gating can land after the first poll, and still take effect.
+
+    ``detect()`` establishes the served banks, but a consumer may already have
+    polled a family's group by then. Narrowing a member drops the pooled plan it
+    is part of, so the next group read is the narrowed one rather than the plan
+    cached before the restriction.
+    """
+    unit = MockModbusConnection().for_unit(0x31)
+    _seed(unit, _cache("hybrid_2_bat_a", 0x31))
+    components, group = components_for("inverter", unit)
+    holding, _ = components
+    await group.async_update()
+    assert any(event.register_type == "holding" and event.address >= 60 for event in unit.read_events)
+
+    restrict_to_banks(holding, [(0, 59)])
+    unit.read_events.clear()
+    await group.async_update()
+
+    holding_reads = [event for event in unit.read_events if event.register_type == "holding"]
+    assert holding_reads and all(event.address < 60 for event in holding_reads), holding_reads
 
 
 async def test_a_restricted_component_reads_only_the_banks_it_kept():

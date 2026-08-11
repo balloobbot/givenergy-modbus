@@ -2,7 +2,9 @@
 
 A survey of ~65 real-world Modbus libraries classified this one **BLOCKED**: a custom "Transparent" framer with an embedded device serial and its own CRC, a mandatory dongle heartbeat, a transmit throttle, FC06-only writes, and last-good data served on a rejected read. The survey's answer to that class of library was that `modbus-connection`'s pure Protocol layer — `ModbusConnection` and the `ModbusUnit` Protocol, neither of which imports a backend — *is* the extension seam, and that such a library needs no library work at all.
 
-This migration tests that claim. The verdict up front: **the transport seam holds completely, and the model framework holds for 1253 of 1260 register definitions.** Nothing in `modbus-connection` had to change, and nothing needed to. Four things had to be reached around — all of them things the shipped backends reach around too — and no gap survived checking as a blocker. Details below, including two findings I withdrew once I measured them.
+This migration tests that claim. The verdict up front: **the transport seam holds completely, and the model framework holds for 1253 of 1260 register definitions.** Nothing in `modbus-connection` had to change, and nothing needed to. Three things had to be reached around — all of them things the shipped backends reach around too — and no gap survived checking as a blocker. Details below, including two findings I withdrew once I measured them.
+
+Written against 4.3, revised on the move to **4.4**, which closed one of the findings below — (i), the live field set — outright. Where a finding changed, the note says so rather than being deleted.
 
 Where this landed:
 
@@ -11,7 +13,7 @@ Where this landed:
 | `givenergy_modbus/connection.py` | 890 lines — the transport as a `ModbusConnection` backend |
 | `givenergy_modbus/model/components.py` | 506 lines — every device family as a `Component` |
 | `givenergy_modbus/client/client.py` | −471 / +183 lines: the socket, the pump tasks and the retry loop moved out |
-| tests | 1766 passing, including the model layer driven end to end over real framing |
+| tests | 1777 passing, including the model layer driven end to end over real framing |
 
 ---
 
@@ -68,7 +70,7 @@ Short list, and none of it is fatal. Nothing was monkeypatched, nothing was vend
 
 `GivEnergyConnection(ModbusConnection)` implements the three documented hooks — `_connect_client`, `_close_client`, `for_unit`. `GivEnergyUnit` satisfies the `ModbusUnit` Protocol structurally; `isinstance(unit, ModbusUnit)` passes and all 19 methods are present. `GivEnergyField(RegisterField)` overrides `decode`, which the class documents as its only abstract method. That is three public extension points used exactly as designed, and they carried the whole migration.
 
-### Reached around — four things
+### Reached around — three things
 
 **`self._client` and `self._lost_callbacks.fire()`.** The base class treats `_client` as "the connected backend client", and `connected` is `_client is not None`. When the link dies — reader EOF, a stalled drain, a socket error — a backend has to make `connected` go false, fire the subscribers, and let the next request start a fresh connect flight. `on_connection_lost()` is public for *subscribing*, and there is no protected helper for *reporting*, so `_note_lost()` does it by hand.
 
@@ -76,11 +78,9 @@ This turns out to be the established pattern rather than a hole: tmodbus's `_on_
 
 **`self._pacer`.** The inherited `Pacer` is protected, which is fine for the connection itself — the producer wraps each wire write in `async with self._pacer.paced(unit_id)`. But `set_message_spacing` lives on the *unit*, and a unit handle is not a subclass of the connection, so `GivEnergyUnit` calls a `set_unit_spacing()` method added to the connection purely to bridge that gap.
 
-**`Component._register_fields`.** `declared_fields` is the class's declared layout, and `restrict_fields()` does not narrow it — so after capability gating the public mapping still lists fields the instance no longer has. Reading the current field set means reading the private dict.
-
 ### One `type: ignore`
 
-`ModbusConnection.__init__` types `params` as `ModbusTcpParams | ModbusUdpParams | ModbusTlsParams | ModbusSerialParams` — a closed union of the four transports the library ships. A third-party transport with its own params dataclass is precisely what the Protocol seam is for, so the union is too narrow by construction. Everything the base class actually *does* with the value works fine on ours; only the annotation objects. One suppressed line, at one construction site.
+`ModbusConnection.__init__` types `params` as `ModbusTcpParams | ModbusUdpParams | ModbusTlsParams | ModbusSerialParams` — a closed union of the four transports the library ships (4.4 dropped the `ModbusParams` alias for it and spells the union inline, which changes nothing here). A third-party transport with its own params dataclass is precisely what the Protocol seam is for, so the union is too narrow by construction. Everything the base class actually *does* with the value works fine on ours; only the annotation objects. One suppressed line, at one construction site.
 
 ### Re-parented our own exception hierarchy
 
@@ -184,11 +184,11 @@ Documented above. `ModbusParams` being a closed union means every third-party tr
 
 Low priority — the workaround is 5 lines and the over-read is free — but worth knowing that "a field is a set of registers" is a shape real devices have.
 
-### i. `restrict_fields` doesn't update `declared_fields`
+### i. ~~`restrict_fields` doesn't update `declared_fields`~~ — closed in 4.4
 
-Narrowing a component leaves the public mapping advertising fields the instance no longer has, so anything introspecting the live field set has to read `_register_fields`.
+Narrowing a component left the public mapping advertising fields the instance no longer had, so anything introspecting the live field set had to read `_register_fields`.
 
-**Fix:** make `declared_fields` instance-aware after a restriction, or add a public `fields` property that reflects the current set.
+4.4's `resolved_fields` is exactly the missing surface, and better than the `fields` property suggested here: it is per instance, narrowed by `restrict_fields`, and each entry carries where the field actually lands (absolute address, register count, scale register, space) rather than only the declared object. `modelled_fields()` and `restrict_to_banks()` are written on it, and the last private read into `Component` is gone. `declared_fields` still means the class's declared layout, which is the right thing for it to mean.
 
 ### j. No retry policy
 
@@ -210,6 +210,7 @@ Worth saying plainly, because it is most of the story:
 - **Connect-on-demand deleted the whole reconnect dance.** The client no longer tracks whether it is connected.
 - **The `Pacer` replaced the hand-rolled throttle cleanly**, and per-unit spacing came free.
 - **The shared-connection model is right for this hardware.** The dongle *is* the bottleneck; two consumers each opening a socket is strictly worse. Making `Client` a consumer rather than an owner was the most clarifying change in the migration.
+- **4.4's readable-range validation found nothing, and that is the point.** The planner now refuses a field its component's map cannot contain, at plan-build time. Every field here already fit, because the ranges are stated at bank granularity and a bank is what the device serves. What it did expose is that our own import-time check was the *weaker* of the two — it asked whether a field's addresses were readable, not whether they sat in one range, so a field straddling two adjacent banks would have passed here and failed at the first poll. `component_class` now applies the planner's rule instead, so a bad LUT edit still fails at import.
 - **`MockModbusUnit` and the `ReadEvent` log made the equivalence tests easy** — seed it from a wire capture, run the real planner, compare against the pydantic model, and assert the exact blocks that got planned.
 - **The converter vocabulary is richer than it looks.** Once `decode` is overridden, every one of this library's converters — scaled numbers, enums, bitfields, byte splits, time slots, datetimes, serials, fault-code bitmask lists — composes into it without fighting the framework.
 

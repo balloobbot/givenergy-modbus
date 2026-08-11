@@ -164,6 +164,14 @@ def _register_class(space: RegisterSpace) -> type[Register]:
     return HR if space == "holding" else IR
 
 
+def _containing_range(address: int, ranges: tuple[Range, ...]) -> Range | None:
+    """The declared readable range ``address`` falls in, if any."""
+    for low, high in ranges:
+        if low <= address <= high:
+            return (low, high)
+    return None
+
+
 def component_class(
     name: str,
     getter: type[RegisterGetter],
@@ -178,8 +186,12 @@ def component_class(
     registers span both spaces becomes two components, pooled by
     :func:`components_for` (see :class:`Component`'s single ``register_space``).
 
-    Raises ``ValueError`` if a field's addresses fall outside ``ranges``, which
-    would leave it unreadable.
+    Raises ``ValueError`` if a field does not fit inside one declared range,
+    which would leave it unreadable. That is the planner's own rule since
+    modbus-connection 4.4 — a block never crosses a range boundary, so a field
+    that straddles one cannot be read even though every address it names is
+    declared. Applying it here fails a bad LUT edit at import rather than at the
+    first poll of whichever device family it landed in.
     """
     register_class = _register_class(space)
     namespace: dict[str, Any] = {
@@ -190,15 +202,16 @@ def component_class(
         # well under the Modbus ceiling of 125.
         "max_span": MAX_REGISTERS_PER_READ,
     }
-    readable = {address for low, high in ranges for address in range(low, high + 1)}
     for field_name, definition in getter.REGISTER_LUT.items():
         if not all(isinstance(register, register_class) for register in definition.registers):
             continue
         field = _field(definition)
-        window = set(range(field.address, field.address + field.count))
-        if not window <= readable:
+        last = field.address + field.count - 1
+        bank = _containing_range(field.address, ranges)
+        if bank is None or last > bank[1]:
             raise ValueError(
-                f"{name}.{field_name} reads {sorted(window - readable)}, outside the declared readable ranges {ranges}"
+                f"{name}.{field_name} reads {field.address}-{last}, which does not fit inside any one "
+                f"of the declared readable ranges {ranges}"
             )
         namespace[field_name] = field
     return type(name, (Component,), namespace)
@@ -403,12 +416,16 @@ INPUT_ONLY_FAMILIES: dict[str, type[Component]] = {
 def modelled_fields(component: Component) -> dict[str, GivEnergyField]:
     """A component's live device fields.
 
-    Reads ``_register_fields`` rather than ``declared_fields`` because the
-    public mapping is the *class's* declared layout and ``restrict_fields``
-    doesn't narrow it — so after capability gating it still lists fields the
-    instance no longer has.
+    Reads ``resolved_fields`` rather than ``declared_fields``: the latter is the
+    *class's* declared layout and ``restrict_fields`` never narrows it, so after
+    capability gating it still lists fields the instance no longer has.
+    ``resolved_fields`` is the instance's own view of what it reads.
     """
-    return {name: field for name, field in component._register_fields.items() if isinstance(field, GivEnergyField)}
+    return {
+        name: resolved.field
+        for name, resolved in component.resolved_fields.items()
+        if isinstance(resolved.field, GivEnergyField)
+    }
 
 
 def components_for(family: str, unit: Any) -> tuple[list[Component], ComponentGroup]:
@@ -468,12 +485,16 @@ def restrict_to_banks(component: Component, banks: Iterable[Range]) -> None:
     ``register_ranges`` is a class attribute, so capability gating happens here
     instead: keep the fields the detected device actually serves and let
     ``restrict_fields`` recompute the ranges around them.
+
+    Keys off ``resolved_fields`` — the addresses the planner will actually read,
+    and narrowed by any earlier restriction — so narrowing twice composes rather
+    than trying to re-add fields the component has already dropped.
     """
     served = {address for low, high in banks for address in range(low, high + 1)}
     keep = [
         name
-        for name, field in component.declared_fields.items()
-        if set(range(field.address, field.address + field.count)) <= served
+        for name, resolved in component.resolved_fields.items()
+        if set(range(resolved.address, resolved.address + resolved.count)) <= served
     ]
     component.restrict_fields(keep)
 

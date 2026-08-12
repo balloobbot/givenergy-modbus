@@ -24,7 +24,7 @@ classifiers = [
 requires-python = ">=3.12"
 dependencies = [
     "crccheck>=1.1,<2",
-    "modbus-connection>=4.5.1,<5",
+    "modbus-connection>=4.6.0,<5",
     "pydantic>=2.0,<3",
     "typing-extensions>=4.9",
 ]

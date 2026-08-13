@@ -207,6 +207,10 @@ The README's framing suggested one; there isn't one. Every consumer facing a fla
 - **`_RANGE_ATTR` maps holding and input to the same `register_ranges` name**, which the source itself notes is ambiguous. Fixing (d) fixes this too.
 - **The 19-method Protocol is a lot of surface for a device with three function codes.** 16 of our 19 methods are one-line `IllegalFunctionError` raises. A mixin supplying those defaults would delete ~80 lines from every partial backend. (The review's suggestion to *trim* the surface was declined; a `PartialModbusUnit` base would get the same benefit without removing anything.)
 
+### l. `async_read_raw()` assumes the diagnostics come from the poll
+
+The device-object guidance has the top-level object dump its raw registers by walking its components, identity first, so that an issue report carries the setup-only blocks and not just the polled ones. That surface already exists here, and it is not a read at all: every response lands in `plant.register_caches` on its way past, `detect()`'s identity bank at `0x11` included, and nothing evicts it — so the dump is `to_compact(plant.register_caches)`, made share-safe by `Plant.redact()` and replayed offline into a full `Plant` by `parse_compact`. An `async_read_raw()` would re-read a plant we are already holding, and on hardware whose peripherals routinely refuse whole banks that is both the slower and the less complete answer. The guidance is right about what has to be in the dump; the shape it recommends is the shape for a library that reads on demand, not for one that caches every register it has ever decoded.
+
 ### What was better than expected
 
 Worth saying plainly, because it is most of the story:

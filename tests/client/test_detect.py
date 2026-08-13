@@ -5,13 +5,14 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from modbus_connection import IllegalDataAddressError
 
 from givenergy_modbus.client.client import Client
 from givenergy_modbus.exceptions import CommunicationError, ConnectionLost, PlantTopologyMismatch
 from givenergy_modbus.model.inverter import Model
 from givenergy_modbus.model.plant import PlantCapabilities
 from givenergy_modbus.model.register import HR, IR
-from givenergy_modbus.pdu import ReadInputRegistersResponse
+from givenergy_modbus.pdu import ReadInputRegistersRequest, ReadInputRegistersResponse
 from tests.transport import prime_session
 
 
@@ -1035,6 +1036,98 @@ async def test_detect_bcu_stacks_hinted_bcu_timeout_marks_absent():
 
     assert caps.bcu_stacks == [(0, 3)]
     assert client.plant.block_present(0x71, "IR", 60, 5) is False
+
+
+# ---------------------------------------------------------------------------
+# A dead link is not an absent device
+#
+# _probe() reports absence as False and its callers latch that with
+# mark_absent(), which refresh() then skips every cycle. ConnectionLost is a
+# TimeoutError, so before the guard in _probe() a link that dropped mid-detect
+# read as "nothing is out there" and amputated the topology permanently.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_probe_propagates_a_dead_link_instead_of_reporting_absence():
+    """ConnectionLost must escape _probe() rather than becoming a False."""
+    client = _make_client()
+    request = ReadInputRegistersRequest(base_register=60, register_count=60, device_address=0x33)
+    with patch.object(
+        client,
+        "send_request_and_await_response",
+        new_callable=AsyncMock,
+        side_effect=ConnectionLost("connection closed"),
+    ):
+        with pytest.raises(ConnectionLost):
+            await client._probe(request, timeout=0.1, retries=0)
+    assert client.plant.block_present(0x33, "IR", 60, 60) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [TimeoutError(), IllegalDataAddressError(message="refused")],
+    ids=["silence", "refusal"],
+)
+async def test_probe_still_reports_absence_for_silence_and_refusal(error):
+    """The dead-link guard must not swallow the two outcomes that DO mean absent."""
+    client = _make_client()
+    request = ReadInputRegistersRequest(base_register=60, register_count=60, device_address=0x33)
+    with patch.object(client, "send_request_and_await_response", new_callable=AsyncMock, side_effect=error):
+        assert await client._probe(request, timeout=0.1, retries=0) is False
+
+
+def _dies_after_identity():
+    """A send_request_and_await_response stand-in: identity lands, then the link drops."""
+    calls = {"n": 0}
+
+    async def _side(request, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return None  # identity read; the cache is pre-primed
+        raise ConnectionLost("connection closed")
+
+    return _side
+
+
+@pytest.mark.asyncio
+async def test_detect_hv_dead_link_raises_rather_than_reporting_an_empty_plant():
+    """The HV path has no other dead-link guard, so this is the whole regression.
+
+    Step 4 (the LV battery sweep, which re-raises ConnectionLost of its own) is
+    skipped for HV, so every probe from step 2 onward used to answer False: an
+    All-in-One whose link dropped after the identity read came back from
+    detect() as a healthy inverter with no BCUs, no battery modules and no
+    meters, and refresh() polled 0x11 alone until the next detect().
+    """
+    client = _make_client()
+    _prime_cache(client, 0x11, {HR(0): 0x8000, HR(21): 0})  # ALL_IN_ONE → is_hv
+
+    with patch.object(
+        client, "send_request_and_await_response", new_callable=AsyncMock, side_effect=_dies_after_identity()
+    ):
+        with pytest.raises(ConnectionLost):
+            await client.detect(timeout=0.1, retries=0, probe_timeout=0.1, probe_retries=0)
+
+    # Nothing latched, and no capabilities — so the next detect() retries clean.
+    assert not [key for key, present in client.plant.register_block_present.items() if not present]
+    assert client.plant.capabilities is None
+
+
+@pytest.mark.asyncio
+async def test_detect_dead_link_does_not_latch_the_meter_sweep_absent():
+    """The 0x01–0x08 meter sweep is pure _probe(), so it latched all eight slots."""
+    client = _make_client()
+    _prime_cache(client, 0x11, {HR(0): 0x2001, HR(21): 0})  # HYBRID
+
+    with patch.object(
+        client, "send_request_and_await_response", new_callable=AsyncMock, side_effect=_dies_after_identity()
+    ):
+        with pytest.raises(ConnectionLost):
+            await client.detect(timeout=0.1, retries=0, probe_timeout=0.1, probe_retries=0)
+
+    assert not [addr for addr, _type, _base, _count in client.plant.register_block_present if addr in range(1, 9)]
 
 
 @pytest.mark.asyncio

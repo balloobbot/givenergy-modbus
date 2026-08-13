@@ -7,7 +7,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 
-from modbus_connection import ModbusExceptionError
+from modbus_connection import ModbusConnectionError, ModbusExceptionError
 
 from givenergy_modbus.connection import Direction, GivEnergyConnection, GivEnergyParams
 from givenergy_modbus.exceptions import (
@@ -595,12 +595,24 @@ class Client:
         Uses ``retry_delay=0`` so absent-device probes don't pay the silent-
         window-survival cost — detect() does many of these and most are
         expected to fail.
+
+        A dead link is not an absent device, so ``ModbusConnectionError``
+        propagates rather than answering False. Callers latch that False as a
+        permanent ``mark_absent`` that ``refresh()`` then skips every cycle, so
+        swallowing a link failure here would silently amputate the topology —
+        an HV plant whose connection dropped mid-detect came back as an inverter
+        with no BCUs, no modules and no meters, and stayed that way until the
+        next detect(). Letting it out instead leaves capabilities unset, which
+        detect()'s teardown turns into a clean retry (#274).
         """
         try:
             await self.send_request_and_await_response(
                 request, timeout=timeout, retries=retries, retry_delay=0, warn_timeout=False
             )
             return True
+        except ModbusConnectionError:
+            # Before DEVICE_DID_NOT_ANSWER: ConnectionLost is also a TimeoutError.
+            raise
         except DEVICE_DID_NOT_ANSWER:
             return False
 

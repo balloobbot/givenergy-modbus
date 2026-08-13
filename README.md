@@ -100,6 +100,33 @@ async def main():
 asyncio.run(main())
 ```
 
+### Partial reads
+
+A poll fans out many register reads — inverter banks, each battery, each meter, each BCU — and
+they are independent: one bank that is slow or refused never discards the ones that did answer.
+Everything that arrived is already committed to the plant, and a bank that failed keeps its
+previous values, so a single offline battery does not blank the rest of the plant.
+
+`refresh()` and `load_config()` return the plant when every read succeeded. When some fail they
+raise `RefreshPartiallySucceeded`, which carries the partial `plant` plus a `failures` list naming
+each read that dropped — that `except` block is the place to decide what a gap means to you.
+Only when *every* read fails, which means the link is effectively dead, do you get `RefreshFailed`:
+
+```python
+from givenergy_modbus.exceptions import RefreshPartiallySucceeded
+
+try:
+    plant = await client.refresh()
+except RefreshPartiallySucceeded as err:
+    plant = err.plant  # everything that did answer
+    for failure in err.failures:
+        print(f"0x{failure.device_address:02x} {failure.request_type} kept its previous values")
+```
+
+Note that a successful poll does not mean *fresh*: the keep-last-good guards can serve
+last-known-good content for a device whose live read was rejected. Gate a display on
+`plant.register_age()` / `plant.block_age()` rather than on the call returning.
+
 ## Credits
 
 This package was created with [Cookiecutter](https://github.com/audreyr/cookiecutter) and

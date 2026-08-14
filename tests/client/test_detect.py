@@ -5,7 +5,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from modbus_connection import IllegalDataAddressError
+from modbus_connection import IllegalDataAddressError, ModbusTimeoutError
 
 from givenergy_modbus.client.client import Client
 from givenergy_modbus.exceptions import CommunicationError, ConnectionLost, PlantTopologyMismatch
@@ -1067,8 +1067,8 @@ async def test_probe_propagates_a_dead_link_instead_of_reporting_absence():
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "error",
-    [TimeoutError(), IllegalDataAddressError(message="refused")],
-    ids=["silence", "refusal"],
+    [TimeoutError(), ModbusTimeoutError("silent"), IllegalDataAddressError(message="refused")],
+    ids=["silence", "library-silence", "refusal"],
 )
 async def test_probe_still_reports_absence_for_silence_and_refusal(error):
     """The dead-link guard must not swallow the two outcomes that DO mean absent."""
